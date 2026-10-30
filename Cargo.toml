@@ -1,0 +1,22 @@
+[package]
+name = "caskade"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Log-structured key/value store inspired by bitcask"
+license = "MIT"
+readme = "README.md"
+keywords = ["key-value", "bitcask", "log-structured", "database"]
+categories = ["database-implementations"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+walkdir = "2.5.0"
