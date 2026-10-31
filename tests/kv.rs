@@ -14,8 +14,8 @@ fn get_stored_value() -> Result<()> {
     store.set("key1".to_owned(), "value1".to_owned())?;
     store.set("key2".to_owned(), "value2".to_owned())?;
 
-    assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-    assert_eq!(store.get("key2".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get("key1".to_owned())?, "value1");
+    assert_eq!(store.get("key2".to_owned())?, "value2");
 
     Ok(())
 }
@@ -27,9 +27,9 @@ fn overwrite_existing_value() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+    assert_eq!(store.get("key1".to_owned())?, "value1");
     store.set("key1".to_owned(), "value2".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get("key1".to_owned())?, "value2");
 
     Ok(())
 }
@@ -41,7 +41,10 @@ fn get_non_existent_value() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    assert_eq!(store.get("key2".to_owned())?, None);
+    assert!(matches!(
+        store.get("key2".to_owned()),
+        Err(KvError::KeyNotFound)
+    ));
 
     Ok(())
 }
@@ -54,7 +57,10 @@ fn remove_existent_key() -> Result<()> {
 
     store.set("key1".to_owned(), "value1".to_owned())?;
     store.remove("key1".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, None);
+    assert!(matches!(
+        store.get("key1".to_owned()),
+        Err(KvError::KeyNotFound)
+    ));
 
     Ok(())
 }
@@ -83,7 +89,7 @@ fn set_after_remove() -> Result<()> {
     store.remove("key1".to_owned())?;
     store.set("key1".to_owned(), "value2".to_owned())?;
 
-    assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get("key1".to_owned())?, "value2");
 
     Ok(())
 }

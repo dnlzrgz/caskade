@@ -26,10 +26,10 @@ impl KvStore {
         Ok(())
     }
 
-    /// Gets the string value of a given string key. Returns `None` if the given
-    /// key doesn't exist.
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        Ok(self.data.get(&key).cloned())
+    /// Gets the string value of a given string key. Returns `KeyNotFound` if the
+    /// given key doesn't exist.
+    pub fn get(&mut self, key: String) -> Result<String> {
+        self.data.get(&key).cloned().ok_or(KeyNotFound)
     }
 
     /// Removes a given key.
