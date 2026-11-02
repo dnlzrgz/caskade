@@ -9,8 +9,8 @@ use caskade::kv::{Durability, KvStore};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-/// Replay logs are sized at about 100k records.
-const RECORDS: usize = 100_000;
+/// Replay logs are sized at one million records.
+const RECORDS: usize = 1_000_000;
 /// Records written per measured append iteration.
 const APPEND_BATCH: usize = 10_000;
 /// Records per iteration when the policy syncs.
