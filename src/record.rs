@@ -212,7 +212,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Command<'_>, usize)> {
 }
 
 #[cfg(test)]
-/// Frames `payload` as a record, as a well-behaved writer would.
 pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
     bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
@@ -225,6 +224,8 @@ pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn sample() -> Command<'static> {
@@ -422,5 +423,96 @@ mod tests {
             decode(&frame(&p)),
             Err(KvError::Corrupt(m)) if m.starts_with("invalid utf-8")
         ));
+    }
+
+    /// Keys and values up to 32 chars: enough for empty, ASCII and multi-byte cases,
+    /// small enough that the default 256 cases stay well under a second.
+    fn any_str() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::char::any(), 0..32).prop_map(String::from_iter)
+    }
+
+    proptest! {
+        #[test]
+        fn encode_decode_round_trip(key in any_str(), value in any_str()) {
+            let mut buf = Vec::new();
+            for cmd in [
+                Command::Set {
+                    key: &key,
+                    value: &value,
+                },
+                Command::Rm { key: &key },
+            ] {
+                encode(&cmd, &mut buf).unwrap();
+                let (decoded, consumed) = decode(&buf).unwrap();
+                prop_assert_eq!(&decoded, &cmd);
+                prop_assert_eq!(consumed, buf.len());
+            }
+        }
+
+        /// A longer record encoded first must not leave bytes behind for the next one.
+        #[test]
+        fn reused_buffer_matches_a_fresh_one(
+            key in any_str(),
+            value in any_str(),
+            other in any_str(),
+        ) {
+            let mut reused = Vec::new();
+            encode(
+                &Command::Set {
+                    key: &other,
+                    value: &other,
+                },
+                &mut reused,
+            )
+            .unwrap();
+            encode(
+                &Command::Set {
+                    key: &key,
+                    value: &value,
+                },
+                &mut reused,
+            )
+            .unwrap();
+
+            let mut fresh = Vec::new();
+            encode(
+                &Command::Set {
+                    key: &key,
+                    value: &value,
+                },
+                &mut fresh,
+            )
+            .unwrap();
+
+            prop_assert_eq!(reused, fresh);
+        }
+
+        /// Hostile edits of a valid record are rejected, never a panic.
+        #[test]
+        fn mutated_record_is_rejected_not_panicked(
+            key in any_str(),
+            value in any_str(),
+            at in 0usize..64,
+            mask in any::<u8>(),
+            cut in 0usize..64,
+        ) {
+            let mut buf = Vec::new();
+            encode(&Command::Set { key: &key, value: &value }, &mut buf).unwrap();
+
+            let mut flipped = buf.clone();
+            let at = at % flipped.len();
+            flipped[at] ^= mask.max(1);
+            let _ = decode(&flipped);
+
+            let cut = cut % buf.len();
+            let _ = decode(&buf[..cut]);
+        }
+
+        /// Recomputing the CRC is what lets arbitrary bytes reach the parser at all.
+        /// With a random `expected_crc` every case would stop at `ChecksumMismatch`.
+        #[test]
+        fn arbitrary_payload_never_panics(payload in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = decode_payload(&payload, crc32fast::hash(&payload));
+        }
     }
 }
