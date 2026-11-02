@@ -16,8 +16,18 @@ fn main() -> Result<()> {
             Err(KvError::KeyNotFound) => println!("key not found"),
             Err(e) => return Err(e),
         },
-        Commands::Set { key, value } => store.set(key, value)?,
-        Commands::Rm { key } => store.remove(&key)?,
+        Commands::Set { key, value, sync } => {
+            store.set(key, value)?;
+            if sync {
+                store.sync()?;
+            }
+        }
+        Commands::Rm { key, sync } => {
+            store.remove(&key)?;
+            if sync {
+                store.sync()?;
+            }
+        }
     }
 
     Ok(())

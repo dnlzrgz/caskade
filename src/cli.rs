@@ -9,7 +9,20 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Get { key: String },
-    Set { key: String, value: String },
-    Rm { key: String },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+        /// Sync this write to disk before exiting.
+        #[arg(long)]
+        sync: bool,
+    },
+    Rm {
+        key: String,
+        /// Sync this write to disk before exiting.
+        #[arg(long)]
+        sync: bool,
+    },
 }
