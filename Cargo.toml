@@ -16,6 +16,21 @@ thiserror = "2.0.21"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+criterion = "0.7.0"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 walkdir = "2.5.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+strip = "none"
+debug = "line-tables-only"
+
+[[bench]]
+name = "kv"
+harness = false

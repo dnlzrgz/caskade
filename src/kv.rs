@@ -18,7 +18,7 @@ const READ_BUF_CAPACITY: usize = 64 * 1024;
 /// The `KvStore` stores string key/value pairs.
 pub struct KvStore {
     // directory for the log and other data.
-    path: PathBuf,
+    _path: PathBuf,
     // Lives as long as the store.
     file: File,
     // store's current state, held in memory.
@@ -44,7 +44,7 @@ impl KvStore {
         replay(&file, &mut data)?;
 
         Ok(Self {
-            path,
+            _path: path,
             file,
             data,
             buf: Vec::new(),
@@ -143,7 +143,7 @@ fn apply(data: &mut HashMap<String, String>, cmd: Command<'_>) {
         Command::Set { key, value } => match data.get_mut(key) {
             Some(slot) => {
                 slot.clear();
-                slot.push_str(&value);
+                slot.push_str(value);
             }
             None => {
                 data.insert(key.to_owned(), value.to_owned());
@@ -188,8 +188,8 @@ mod tests {
         assert_eq!(
             cmd,
             Command::Set {
-                key: "key1".into(),
-                value: "value1".into(),
+                key: "key1",
+                value: "value1",
             }
         );
         assert_eq!(consumed, bytes.len());

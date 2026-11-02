@@ -75,6 +75,7 @@ impl Header {
         Ok(Header { payload_len, crc })
     }
 
+    #[cfg(test)]
     pub(crate) fn record_len(&self) -> usize {
         HEADER_LEN + self.payload_len
     }
