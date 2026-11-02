@@ -209,8 +209,8 @@ mod tests {
 
     fn sample() -> Command<'static> {
         Command::Set {
-            key: "ab".into(),
-            value: "c".into(),
+            key: "ab",
+            value: "c",
         }
     }
 
@@ -237,7 +237,7 @@ mod tests {
                 key: "ü",
                 value: "€",
             },
-            Command::Rm { key: "k".into() },
+            Command::Rm { key: "k" },
         ];
         for cmd in &records {
             encode(cmd, &mut buf).unwrap();
