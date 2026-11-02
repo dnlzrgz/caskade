@@ -137,7 +137,7 @@ fn overwrite_existing_value() -> Result<()> {
     Ok(())
 }
 
-// Should return `None` for non-existent key.
+// Should return `KeyNotFound` for a non-existent key.
 #[test]
 fn get_non_existent_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");

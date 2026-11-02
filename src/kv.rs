@@ -48,7 +48,7 @@ pub struct KvStore {
     // Appends since the last sync; only used by `Durability::Periodic`.
     unsynced_appends: u32,
     last_sync: Instant,
-    // Set when a write or sync failed: the store must be reopened.
+    // Set when a write or sync failed: store must be reopened.
     poisoned: bool,
 }
 

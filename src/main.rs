@@ -2,20 +2,28 @@ use clap::Parser;
 
 use caskade::{
     cli::{Cli, Commands},
-    error::{KvError, Result},
-    kv::KvStore,
+    error::Result,
+    kv::{KvStore, LOG_FILE},
 };
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("caskade: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut store = KvStore::open(std::env::current_dir()?)?;
+    let mut store = KvStore::open(&cli.db)?;
+    let dropped = store.dropped_bytes();
+    if dropped > 0 {
+        let unit = if dropped == 1 { "byte" } else { "bytes" };
+        eprintln!("caskade: dropped {dropped} {unit} of torn tail from {LOG_FILE}");
+    }
 
     match cli.command {
-        Commands::Get { key } => match store.get(&key) {
-            Ok(value) => println!("{value}"),
-            Err(KvError::KeyNotFound) => println!("key not found"),
-            Err(e) => return Err(e),
-        },
+        Commands::Get { key } => println!("{}", store.get(&key)?),
         Commands::Set { key, value, sync } => {
             store.set(key, value)?;
             if sync {

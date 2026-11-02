@@ -1,8 +1,14 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(version, about, name = "caskade")]
 pub struct Cli {
+    /// Store directory.
+    #[arg(long = "db", global = true, value_name = "DIR", default_value = ".")]
+    pub db: PathBuf,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -15,13 +21,13 @@ pub enum Commands {
     Set {
         key: String,
         value: String,
-        /// Sync this write to disk before exiting.
+        /// Sync to disk before exiting.
         #[arg(long)]
         sync: bool,
     },
     Rm {
         key: String,
-        /// Sync this write to disk before exiting.
+        /// Sync to disk before exiting.
         #[arg(long)]
         sync: bool,
     },
