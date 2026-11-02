@@ -11,13 +11,13 @@ fn main() -> Result<()> {
     let mut store = KvStore::open(std::env::current_dir()?)?;
 
     match cli.command {
-        Commands::Get { key } => match store.get(key) {
+        Commands::Get { key } => match store.get(&key) {
             Ok(value) => println!("{value}"),
             Err(KvError::KeyNotFound) => println!("key not found"),
             Err(e) => return Err(e),
         },
         Commands::Set { key, value } => store.set(key, value)?,
-        Commands::Rm { key } => store.remove(key)?,
+        Commands::Rm { key } => store.remove(&key)?,
     }
 
     Ok(())

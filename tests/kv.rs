@@ -14,8 +14,8 @@ fn get_stored_value() -> Result<()> {
     store.set("key1".to_owned(), "value1".to_owned())?;
     store.set("key2".to_owned(), "value2".to_owned())?;
 
-    assert_eq!(store.get("key1".to_owned())?, "value1");
-    assert_eq!(store.get("key2".to_owned())?, "value2");
+    assert_eq!(store.get("key1")?, "value1");
+    assert_eq!(store.get("key2")?, "value2");
 
     Ok(())
 }
@@ -27,9 +27,9 @@ fn overwrite_existing_value() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, "value1");
+    assert_eq!(store.get("key1")?, "value1");
     store.set("key1".to_owned(), "value2".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, "value2");
+    assert_eq!(store.get("key1")?, "value2");
 
     Ok(())
 }
@@ -41,10 +41,7 @@ fn get_non_existent_value() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    assert!(matches!(
-        store.get("key2".to_owned()),
-        Err(KvError::KeyNotFound)
-    ));
+    assert!(matches!(store.get("key2"), Err(KvError::KeyNotFound)));
 
     Ok(())
 }
@@ -56,11 +53,8 @@ fn remove_existent_key() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    store.remove("key1".to_owned())?;
-    assert!(matches!(
-        store.get("key1".to_owned()),
-        Err(KvError::KeyNotFound)
-    ));
+    store.remove("key1")?;
+    assert!(matches!(store.get("key1"), Err(KvError::KeyNotFound)));
 
     Ok(())
 }
@@ -71,10 +65,7 @@ fn remove_non_existent_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    assert!(matches!(
-        store.remove("key1".to_owned()),
-        Err(KvError::KeyNotFound)
-    ));
+    assert!(matches!(store.remove("key1"), Err(KvError::KeyNotFound)));
 
     Ok(())
 }
@@ -86,10 +77,10 @@ fn set_after_remove() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
 
     store.set("key1".to_owned(), "value1".to_owned())?;
-    store.remove("key1".to_owned())?;
+    store.remove("key1")?;
     store.set("key1".to_owned(), "value2".to_owned())?;
 
-    assert_eq!(store.get("key1".to_owned())?, "value2");
+    assert_eq!(store.get("key1")?, "value2");
 
     Ok(())
 }

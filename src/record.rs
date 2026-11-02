@@ -37,9 +37,9 @@ impl Tag {
 
 /// One log entry (verb + operands)
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Command {
-    Set { key: String, value: String },
-    Rm { key: String },
+pub(crate) enum Command<'a> {
+    Set { key: &'a str, value: &'a str },
+    Rm { key: &'a str },
 }
 
 /// A parsed record header.
@@ -80,7 +80,7 @@ impl Header {
     }
 }
 
-pub(crate) fn encode(cmd: &Command, buf: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
     let payload_len = match cmd {
         Command::Set { key, value } => 1 + 4 + key.len() + 4 + value.len(),
         Command::Rm { key } => 1 + 4 + key.len() + 4,
@@ -120,7 +120,7 @@ pub(crate) fn encode(cmd: &Command, buf: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Command> {
+pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Command<'_>> {
     // Checksum before parsing
     if crc32fast::hash(payload) != expected_crc {
         return Err(KvError::Corrupt("checksum mismatch".to_owned()));
@@ -135,11 +135,11 @@ pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Comman
     pos += 1;
     let tag = Tag::from_byte(tag)?;
 
-    let key = take_string(payload, &mut pos)?;
+    let key = take_str(payload, &mut pos)?;
     let cmd = match tag {
         Tag::Set => Command::Set {
             key,
-            value: take_string(payload, &mut pos)?,
+            value: take_str(payload, &mut pos)?,
         },
         Tag::Rm => {
             // Rm still carries the field; a non-zero length means a broken writer.
@@ -162,7 +162,31 @@ pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Comman
     Ok(cmd)
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<(Command, usize)> {
+fn take_u32(payload: &[u8], pos: &mut usize) -> Result<u32> {
+    let n = payload
+        .get(*pos..)
+        .and_then(|rest| rest.first_chunk::<4>())
+        .ok_or_else(|| KvError::Corrupt("truncated length field".to_owned()))?;
+    *pos += 4;
+
+    Ok(u32::from_le_bytes(*n))
+}
+
+fn take_str<'a>(payload: &'a [u8], pos: &mut usize) -> Result<&'a str> {
+    let len = take_u32(payload, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| KvError::Corrupt("length overflow".to_owned()))?;
+    let chunk = payload
+        .get(*pos..end)
+        .ok_or_else(|| KvError::Corrupt(format!("truncated field: need {len} bytes")))?;
+    *pos = end;
+
+    std::str::from_utf8(chunk).map_err(|_| KvError::Corrupt("invalid utf-8 in record".to_owned()))
+}
+
+#[cfg(test)]
+pub(crate) fn decode(bytes: &[u8]) -> Result<(Command<'_>, usize)> {
     let header = Header::decode(bytes)?;
     let end = header.record_len();
 
@@ -178,36 +202,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Command, usize)> {
     Ok((cmd, end))
 }
 
-fn take_u32(payload: &[u8], pos: &mut usize) -> Result<u32> {
-    let n = payload
-        .get(*pos..)
-        .and_then(|rest| rest.first_chunk::<4>())
-        .ok_or_else(|| KvError::Corrupt("truncated length field".to_owned()))?;
-    *pos += 4;
-
-    Ok(u32::from_le_bytes(*n))
-}
-
-fn take_string(payload: &[u8], pos: &mut usize) -> Result<String> {
-    let len = take_u32(payload, pos)? as usize;
-    let end = pos
-        .checked_add(len)
-        .ok_or_else(|| KvError::Corrupt("length overflow".to_owned()))?;
-    let chunk = payload
-        .get(*pos..end)
-        .ok_or_else(|| KvError::Corrupt(format!("truncated field: need {len} bytes")))?;
-    *pos = end;
-
-    let s = std::str::from_utf8(chunk)
-        .map_err(|_| KvError::Corrupt("invalid utf-8 in record".to_owned()))?;
-    Ok(s.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample() -> Command {
+    fn sample() -> Command<'static> {
         Command::Set {
             key: "ab".into(),
             value: "c".into(),
@@ -226,16 +225,16 @@ mod tests {
         let mut buf = Vec::new();
         let records = [
             Command::Set {
-                key: "k".into(),
-                value: "v".into(),
+                key: "k",
+                value: "v",
             },
             Command::Set {
-                key: "e".into(),
-                value: String::new(),
+                key: "e",
+                value: "",
             },
             Command::Set {
-                key: "ü".into(),
-                value: "€".into(),
+                key: "ü",
+                value: "€",
             },
             Command::Rm { key: "k".into() },
         ];
@@ -264,9 +263,8 @@ mod tests {
     #[test]
     fn encode_rejects_oversized_record_and_leaves_buf_alone() {
         let mut buf = vec![1, 2, 3];
-        let cmd = Command::Rm {
-            key: "a".repeat(MAX_RECORD),
-        };
+        let key = "a".repeat(MAX_RECORD);
+        let cmd = Command::Rm { key: &key };
         assert!(matches!(
             encode(&cmd, &mut buf),
             Err(KvError::Corrupt(m)) if m.starts_with("record too large")
@@ -382,6 +380,18 @@ mod tests {
         assert!(matches!(
             decode(&buf),
             Err(KvError::Corrupt(m)) if m.starts_with("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_is_corrupt() {
+        let mut p = vec![TAG_RM];
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.push(0xFF);
+        p.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode(&frame(&p)),
+            Err(KvError::Corrupt(m)) if m.starts_with("invalid utf-8")
         ));
     }
 }
