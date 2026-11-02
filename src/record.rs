@@ -2,20 +2,24 @@
 //! everything else treats records as opaque values.
 //!
 //! ```text
-//! record  := [len: u32 LE][crc: u32 LE][payload]
+//! record  := [len: u32 LE][crc: u32 LE][hcrc: u32 LE][payload]
 //! payload := tag u8 | key_len u32 LE | key | value_len u32 LE | value
 //! tag     := 0x00 Set | 0x01 Rm (value_len = 0, no value bytes)
 //! crc     := CRC-32 of payload only
+//! hcrc    := CRC-32 of [len][crc]. Without it a damaged length cannot be told
+//!            apart from a payload cut short by a crash, and replay would throw
+//!            away the good records behind it.
 //! len     := payload length, so a record spans HEADER_LEN + len bytes
 //! ```
+//!
+//! The layout is not versioned: changing it makes existing logs unreadable.
 
 use crate::error::{KvError, Result};
 
 /// Largest payload accepted.
 const MAX_RECORD: usize = 64 << 20; // 64 MiB
-
-/// Size of [len][crc].
-const HEADER_LEN: usize = 8;
+/// Size of [len][crc][hcrc].
+const HEADER_LEN: usize = 12;
 
 const TAG_SET: u8 = 0x00;
 const TAG_RM: u8 = 0x01;
@@ -53,8 +57,8 @@ pub(crate) struct Header {
 impl Header {
     pub(crate) const SIZE: usize = HEADER_LEN;
 
-    /// Parses the header from the first `SIZE` bytes of `bytes`; any extra bytes
-    /// are ignored, so a caller may pass a whole record.
+    /// Parses the header from the first `SIZE` bytes of `bytes`. Extra bytes are
+    /// ignored, so a caller may pass a whole record.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Header> {
         if bytes.len() < HEADER_LEN {
             return Err(KvError::Corrupt(format!(
@@ -63,7 +67,13 @@ impl Header {
             )));
         }
         let payload_len = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
-        let crc = u32::from_le_bytes(bytes[4..HEADER_LEN].try_into().expect("4 bytes"));
+        let crc = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        let hcrc = u32::from_le_bytes(bytes[8..HEADER_LEN].try_into().expect("4 bytes"));
+
+        // A length read from disk is only trustworthy if its own checksum matches.
+        if crc32fast::hash(&bytes[..8]) != hcrc {
+            return Err(KvError::Corrupt("header checksum mismatch".to_owned()));
+        }
 
         // `payload_len` came off disk and is untrusted.
         if payload_len > MAX_RECORD {
@@ -75,7 +85,6 @@ impl Header {
         Ok(Header { payload_len, crc })
     }
 
-    #[cfg(test)]
     pub(crate) fn record_len(&self) -> usize {
         HEADER_LEN + self.payload_len
     }
@@ -88,9 +97,7 @@ pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
     };
     if payload_len > MAX_RECORD {
         // Nothing has been touched, so the caller's buffer is unchanged.
-        return Err(KvError::Corrupt(format!(
-            "record too large: {payload_len} bytes"
-        )));
+        return Err(KvError::RecordTooLarge(payload_len));
     }
 
     buf.clear();
@@ -109,14 +116,15 @@ pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
             buf.push(TAG_RM);
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key.as_bytes());
-            // Omitting this would make the next field's bytes parse as a value length.
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
     }
 
     let crc = crc32fast::hash(&buf[HEADER_LEN..]);
     buf[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    buf[4..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    buf[4..8].copy_from_slice(&crc.to_le_bytes());
+    let hcrc = crc32fast::hash(&buf[..8]);
+    buf[8..HEADER_LEN].copy_from_slice(&hcrc.to_le_bytes());
 
     Ok(())
 }
@@ -124,11 +132,11 @@ pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
 pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Command<'_>> {
     // Checksum before parsing
     if crc32fast::hash(payload) != expected_crc {
-        return Err(KvError::Corrupt("checksum mismatch".to_owned()));
+        return Err(KvError::ChecksumMismatch);
     }
 
     // Walk the payload with a cursor. Every field is read through `get`, which
-    // fails instead of panicking when the payload is shorter than it should.
+    // fails when the payload is shorter than it should.
     let mut pos = 0;
     let tag = *payload
         .get(pos)
@@ -204,6 +212,18 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(Command<'_>, usize)> {
 }
 
 #[cfg(test)]
+/// Frames `payload` as a record, as a well-behaved writer would.
+pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    let hcrc = crc32fast::hash(&bytes[..8]);
+    bytes[8..HEADER_LEN].copy_from_slice(&hcrc.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -214,11 +234,13 @@ mod tests {
         }
     }
 
-    fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
-        bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
+    /// A header for `payload_len`, sealed with a valid checksum.
+    fn header_bytes(payload_len: usize) -> [u8; HEADER_LEN] {
+        let mut h = [0u8; HEADER_LEN];
+        h[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        let hcrc = crc32fast::hash(&h[..8]);
+        h[8..].copy_from_slice(&hcrc.to_le_bytes());
+        h
     }
 
     #[test]
@@ -268,14 +290,14 @@ mod tests {
         let cmd = Command::Rm { key: &key };
         assert!(matches!(
             encode(&cmd, &mut buf),
-            Err(KvError::Corrupt(m)) if m.starts_with("record too large")
+            Err(KvError::RecordTooLarge(_))
         ));
         assert_eq!(buf, [1, 2, 3]);
     }
 
     #[test]
     fn truncated_header_is_corrupt() {
-        let header = [0u8; HEADER_LEN];
+        let header = header_bytes(16);
         for n in [0, 1, HEADER_LEN - 1] {
             assert!(matches!(
                 Header::decode(&header[..n]),
@@ -286,8 +308,7 @@ mod tests {
 
     #[test]
     fn oversized_len_is_rejected_by_header() {
-        let mut h = [0u8; HEADER_LEN];
-        h[..4].copy_from_slice(&((MAX_RECORD + 1) as u32).to_le_bytes());
+        let h = header_bytes(MAX_RECORD + 1);
         assert!(matches!(
             Header::decode(&h),
             Err(KvError::Corrupt(m)) if m.starts_with("record too large")
@@ -296,9 +317,18 @@ mod tests {
 
     #[test]
     fn max_record_len_is_accepted_by_header() {
-        let mut h = [0u8; HEADER_LEN];
-        h[..4].copy_from_slice(&(MAX_RECORD as u32).to_le_bytes());
+        let h = header_bytes(MAX_RECORD);
         assert_eq!(Header::decode(&h).unwrap().payload_len, MAX_RECORD);
+    }
+
+    #[test]
+    fn damaged_header_is_corrupt() {
+        let mut h = header_bytes(16);
+        h[0] ^= 0x01; // flip a byte of the length, leave the checksum alone
+        assert!(matches!(
+            Header::decode(&h),
+            Err(KvError::Corrupt(m)) if m.starts_with("header checksum mismatch")
+        ));
     }
 
     #[test]
@@ -366,11 +396,9 @@ mod tests {
     fn flipped_payload_byte_is_corrupt() {
         let mut buf = Vec::new();
         encode(&sample(), &mut buf).unwrap();
-        *buf.last_mut().unwrap() ^= 0x01;
-        assert!(matches!(
-            decode(&buf),
-            Err(KvError::Corrupt(m)) if m.starts_with("checksum mismatch")
-        ));
+        let last = buf.len() - 1;
+        buf[last] ^= 0x01;
+        assert!(matches!(decode(&buf), Err(KvError::ChecksumMismatch)));
     }
 
     #[test]
@@ -380,7 +408,7 @@ mod tests {
         buf[4] ^= 0x01;
         assert!(matches!(
             decode(&buf),
-            Err(KvError::Corrupt(m)) if m.starts_with("checksum mismatch")
+            Err(KvError::Corrupt(m)) if m.starts_with("header checksum mismatch")
         ));
     }
 

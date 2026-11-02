@@ -6,6 +6,14 @@ pub enum KvError {
     Io(#[from] std::io::Error),
     #[error("corrupt log record: {0}")]
     Corrupt(String),
+    #[error("checksum mismatch")]
+    ChecksumMismatch,
+    #[error("record too large: {0} bytes")]
+    RecordTooLarge(usize),
+    #[error("directory is locked by another store")]
+    Locked,
+    #[error("store is poisoned after a failed write")]
+    Poisoned,
 }
 
 pub type Result<T> = std::result::Result<T, KvError>;

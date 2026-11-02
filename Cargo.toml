@@ -2,7 +2,7 @@
 name = "caskade"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Log-structured key/value store inspired by bitcask"
 license = "MIT"
 readme = "README.md"

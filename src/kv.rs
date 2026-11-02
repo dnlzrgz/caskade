@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufReader, Read, Write},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -13,7 +14,21 @@ use crate::{
     record::{self, Command, Header},
 };
 
+pub const LOG_FILE: &str = "caskade.log";
 const READ_BUF_CAPACITY: usize = 64 * 1024;
+
+/// How often an append is followed by `File::sync_data`.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Durability {
+    /// Sync after every append (slowest). An `Ok` means the bytes are on disk.
+    Always,
+    /// Sync when either limit trips. Pending appends are also synced when the store
+    /// is dropped.
+    Periodic { writes: u32, interval: Duration },
+    /// Never sync.
+    #[default]
+    Never,
+}
 
 /// The `KvStore` stores string key/value pairs.
 pub struct KvStore {
@@ -25,9 +40,17 @@ pub struct KvStore {
     data: HashMap<String, String>,
     // Reused scratch buffer for encoding.
     buf: Vec<u8>,
+    // Byte length of the log that replayed cleanly (where next append lands).
+    len: u64,
+    // Bytes of a torn tail dropped when the store was opened.
+    dropped_bytes: u64,
+    durability: Durability,
+    // Appends since the last sync; only used by `Durability::Periodic`.
+    unsynced_appends: u32,
+    last_sync: Instant,
+    // Set when a write or sync failed: the store must be reopened.
+    poisoned: bool,
 }
-
-const LOG_FILE: &str = "caskade.log";
 
 impl KvStore {
     /// Opens a `KvStore` with the given path, replaying the log into memory.
@@ -39,22 +62,92 @@ impl KvStore {
             .append(true)
             .create(true)
             .open(path.join(LOG_FILE))?;
+        file.try_lock().map_err(|e| match e {
+            TryLockError::WouldBlock => KvError::Locked,
+            TryLockError::Error(e) => e.into(),
+        })?;
 
         let mut data = HashMap::new();
-        replay(&file, &mut data)?;
+        let len = replay(&file, &mut data)?;
+        let file_len = file.metadata()?.len();
+        let dropped_bytes = file_len - len;
+        if dropped_bytes > 0 {
+            file.set_len(len)?;
+        }
 
         Ok(Self {
             _path: path,
             file,
             data,
             buf: Vec::new(),
+            len,
+            dropped_bytes,
+            durability: Durability::default(),
+            unsynced_appends: 0,
+            last_sync: Instant::now(),
+            poisoned: false,
         })
     }
 
+    /// Bytes of a torn tail dropped when the store was opened.
+    pub fn dropped_bytes(&self) -> u64 {
+        self.dropped_bytes
+    }
+
+    /// Changes the durability policy.
+    pub fn set_durability(&mut self, durability: Durability) {
+        self.durability = durability;
+        self.unsynced_appends = 0;
+        self.last_sync = Instant::now();
+    }
+
     fn append(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if self.poisoned {
+            return Err(KvError::Poisoned);
+        }
+
         record::encode(cmd, &mut self.buf)?;
-        self.file.write_all(&self.buf)?;
-        self.file.flush()?;
+        let start = self.len;
+        if let Err(e) = self.file.write_all(&self.buf) {
+            // A half-written record would put every later append after garbage, so
+            // cut the log back to its last good record.
+            if self.file.set_len(start).is_err() {
+                self.poisoned = true;
+            }
+            return Err(e.into());
+        }
+        self.len += self.buf.len() as u64;
+        self.sync_if_due()?;
+
+        Ok(())
+    }
+
+    /// Applies the durability policy after a record has been written.
+    fn sync_if_due(&mut self) -> Result<()> {
+        let due = match self.durability {
+            Durability::Always => true,
+            Durability::Never => false,
+            Durability::Periodic { writes, interval } => {
+                self.unsynced_appends += 1;
+                self.unsynced_appends >= writes || self.last_sync.elapsed() >= interval
+            }
+        };
+        if !due {
+            return Ok(());
+        }
+
+        self.sync()
+    }
+
+    /// Forces the log to disk now, whatever the durability policy is.
+    pub fn sync(&mut self) -> Result<()> {
+        if let Err(e) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+        self.unsynced_appends = 0;
+        self.last_sync = Instant::now();
+
         Ok(())
     }
 
@@ -89,21 +182,40 @@ impl KvStore {
     }
 }
 
-/// Replays the whole log into memory. Right now any error aborts the whole operation.
-fn replay(reader: impl Read, data: &mut HashMap<String, String>) -> Result<()> {
+impl Drop for KvStore {
+    fn drop(&mut self) {
+        // A `Periodic` store would otherwise never sync when the process appends
+        // once and exits.
+        if self.unsynced_appends > 0 {
+            let _ = self.file.sync_data();
+        }
+    }
+}
+
+/// Replays the whole log into memory.
+fn replay(reader: impl Read, data: &mut HashMap<String, String>) -> Result<u64> {
     let mut reader = BufReader::with_capacity(READ_BUF_CAPACITY, reader);
     let mut header_buf = [0u8; Header::SIZE];
     let mut payload = Vec::new();
+    let mut offset = 0;
 
     loop {
         let n = read_up_to(&mut reader, &mut header_buf)?;
         if n == 0 {
-            return Ok(());
+            return Ok(offset);
         }
         if n < Header::SIZE {
-            return Err(KvError::Corrupt(format!("truncated header: {n} bytes")));
+            return Ok(offset); // torn header
         }
-        let header = Header::decode(&header_buf)?;
+        let header = match Header::decode(&header_buf) {
+            Ok(header) => header,
+            Err(e) => {
+                if rest_is_zero(&mut reader)? {
+                    return Ok(offset);
+                }
+                return Err(e);
+            }
+        };
 
         payload.clear();
         let got = reader
@@ -111,13 +223,37 @@ fn replay(reader: impl Read, data: &mut HashMap<String, String>) -> Result<()> {
             .take(header.payload_len as u64)
             .read_to_end(&mut payload)?;
         if got < header.payload_len {
-            return Err(KvError::Corrupt(format!(
-                "truncated payload: need {} bytes, have {got}",
-                header.payload_len
-            )));
+            return Ok(offset);
         }
 
-        apply(data, record::decode_payload(&payload, header.crc)?);
+        match record::decode_payload(&payload, header.crc) {
+            Ok(cmd) => apply(data, cmd),
+            Err(KvError::ChecksumMismatch) => {
+                if !rest_is_zero(&mut reader)? {
+                    return Err(KvError::ChecksumMismatch);
+                }
+                return Ok(offset);
+            }
+            Err(e) => return Err(e),
+        }
+
+        offset += header.record_len() as u64;
+    }
+}
+
+/// True when only zero bytes remain, which is what some filesystems leave behind
+/// after a crash.
+fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let n = read_up_to(reader, &mut chunk)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        if chunk[..n].iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
     }
 }
 
@@ -171,10 +307,10 @@ mod tests {
         out
     }
 
-    fn run(reader: impl Read) -> Result<HashMap<String, String>> {
+    fn run(reader: impl Read) -> Result<(HashMap<String, String>, u64)> {
         let mut data = HashMap::new();
-        replay(reader, &mut data)?;
-        Ok(data)
+        let len = replay(reader, &mut data)?;
+        Ok((data, len))
     }
 
     #[test]
@@ -199,7 +335,10 @@ mod tests {
 
     #[test]
     fn replay_empty_input_gives_empty_map() -> Result<()> {
-        assert!(run(Cursor::new(Vec::new()))?.is_empty());
+        let (data, len) = run(Cursor::new(Vec::new()))?;
+        assert!(data.is_empty());
+        assert_eq!(len, 0);
+
         Ok(())
     }
 
@@ -220,10 +359,12 @@ mod tests {
             },
             Command::Rm { key: "b" },
         ]);
+        let total = bytes.len() as u64;
 
-        let data = run(Cursor::new(bytes))?;
+        let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 1);
         assert_eq!(data["a"], "3");
+        assert_eq!(len, total);
 
         Ok(())
     }
@@ -238,45 +379,92 @@ mod tests {
             bytes.extend_from_slice(&buf);
         }
         assert!(bytes.len() > READ_BUF_CAPACITY);
+        let total = bytes.len() as u64;
 
-        let data = run(Cursor::new(bytes))?;
+        let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 5000);
         assert_eq!(data["key0"], "value0");
         assert_eq!(data["key4999"], "value4999");
+        assert_eq!(len, total);
 
         Ok(())
     }
 
     #[test]
-    fn replay_partial_header_is_corrupt() {
+    fn replay_partial_header_recovers() -> Result<()> {
         let bytes = log_bytes(&[Command::Set {
             key: "a",
             value: "1",
         }]);
+        let good_len = bytes.len() as u64;
 
         // 3 stray bytes after one good record, then 3 bytes with nothing before them.
         let mut tail = bytes.clone();
         tail.extend_from_slice(&bytes[..3]);
-        for input in [tail, bytes[..3].to_vec()] {
-            assert!(matches!(
-                run(Cursor::new(input)),
-                Err(KvError::Corrupt(m)) if m.starts_with("truncated header")
-            ));
-        }
+
+        let (data, len) = run(Cursor::new(tail))?;
+        assert_eq!(data["a"], "1");
+        assert_eq!(len, good_len);
+
+        let (data, len) = run(Cursor::new(bytes[..3].to_vec()))?;
+        assert!(data.is_empty());
+        assert_eq!(len, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn replay_partial_payload_is_corrupt() {
-        let mut bytes = log_bytes(&[Command::Set {
+    fn replay_partial_payload_recovers() -> Result<()> {
+        let mut bytes = log_bytes(&[
+            Command::Set {
+                key: "a",
+                value: "1",
+            },
+            Command::Set {
+                key: "b",
+                value: "2",
+            },
+        ]);
+        let good_len = log_bytes(&[Command::Set {
             key: "a",
             value: "1",
-        }]);
+        }])
+        .len() as u64;
         bytes.pop();
 
-        assert!(matches!(
-            run(Cursor::new(bytes)),
-            Err(KvError::Corrupt(m)) if m.starts_with("truncated payload")
-        ));
+        let (data, len) = run(Cursor::new(bytes))?;
+        assert_eq!(data.len(), 1);
+        assert_eq!(data["a"], "1");
+        assert_eq!(len, good_len);
+
+        Ok(())
+    }
+
+    #[test]
+    fn replay_corrupt_final_record_recovers() -> Result<()> {
+        let mut bytes = log_bytes(&[
+            Command::Set {
+                key: "a",
+                value: "1",
+            },
+            Command::Set {
+                key: "b",
+                value: "2",
+            },
+        ]);
+        let good_len = log_bytes(&[Command::Set {
+            key: "a",
+            value: "1",
+        }])
+        .len() as u64;
+        *bytes.last_mut().unwrap() ^= 0x01;
+
+        let (data, len) = run(Cursor::new(bytes))?;
+        assert_eq!(data.len(), 1);
+        assert_eq!(data["a"], "1");
+        assert_eq!(len, good_len);
+
+        Ok(())
     }
 
     #[test]
@@ -295,7 +483,140 @@ mod tests {
 
         assert!(matches!(
             run(Cursor::new(bytes)),
-            Err(KvError::Corrupt(m)) if m.starts_with("checksum mismatch")
+            Err(KvError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn replay_damaged_header_mid_log_is_corrupt() {
+        let mut bytes = log_bytes(&[
+            Command::Set {
+                key: "a",
+                value: "1",
+            },
+            Command::Set {
+                key: "b",
+                value: "2",
+            },
+        ]);
+        // Inflate the first record's length; the record's own tail is still intact.
+        bytes[0] ^= 0x01;
+
+        assert!(matches!(
+            run(Cursor::new(bytes)),
+            Err(KvError::Corrupt(m)) if m.starts_with("header checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn replay_valid_checksum_with_unknown_tag_is_corrupt() {
+        let mut bytes = log_bytes(&[Command::Set {
+            key: "a",
+            value: "1",
+        }]);
+        bytes.extend_from_slice(&record::frame(&[0x02]));
+
+        assert!(matches!(
+            run(Cursor::new(bytes)),
+            Err(KvError::Corrupt(m)) if m.starts_with("unknown tag")
+        ));
+    }
+
+    #[test]
+    fn replay_zero_filled_tail_recovers() -> Result<()> {
+        let mut bytes = log_bytes(&[
+            Command::Set {
+                key: "a",
+                value: "1",
+            },
+            Command::Set {
+                key: "b",
+                value: "2",
+            },
+        ]);
+        let good_len = bytes.len() as u64;
+        bytes.extend_from_slice(&[0u8; 64]);
+
+        let (data, len) = run(Cursor::new(bytes))?;
+        assert_eq!(data.len(), 2);
+        assert_eq!(len, good_len);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_append_poisons_the_store() -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        let mut store = KvStore::open(dir.path())?;
+        store.set("a".to_owned(), "1".to_owned())?;
+        let good_len = store.len;
+
+        store.file = File::open(dir.path().join(LOG_FILE))?;
+
+        assert!(matches!(
+            store.set("b".to_owned(), "2".to_owned()),
+            Err(KvError::Io(_))
+        ));
+        assert!(store.poisoned);
+        assert!(matches!(store.get("b"), Err(KeyNotFound)));
+        assert_eq!(
+            fs::metadata(dir.path().join(LOG_FILE)).unwrap().len(),
+            good_len
+        );
+        assert!(matches!(
+            store.set("c".to_owned(), "3".to_owned()),
+            Err(KvError::Poisoned)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_durability_syncs_on_schedule() -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        let mut store = KvStore::open(dir.path())?;
+        store.set_durability(Durability::Periodic {
+            writes: 2,
+            interval: Duration::from_secs(3600),
+        });
+
+        store.set("a".to_owned(), "1".to_owned())?;
+        assert_eq!(store.unsynced_appends, 1);
+        store.set("b".to_owned(), "2".to_owned())?;
+        assert_eq!(store.unsynced_appends, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_forces_pending_appends() -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        let mut store = KvStore::open(dir.path())?;
+        store.set_durability(Durability::Periodic {
+            writes: 100,
+            interval: Duration::from_secs(3600),
+        });
+
+        store.set("a".to_owned(), "1".to_owned())?;
+        assert_eq!(store.unsynced_appends, 1);
+        store.sync()?;
+        assert_eq!(store.unsynced_appends, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn always_durability_persists() -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut store = KvStore::open(dir.path())?;
+            store.set_durability(Durability::Always);
+            store.set("a".to_owned(), "1".to_owned())?;
+        }
+
+        let store = KvStore::open(dir.path())?;
+        assert_eq!(store.get("a")?, "1");
+
+        Ok(())
     }
 }
