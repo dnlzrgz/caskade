@@ -1,16 +1,14 @@
 use std::{
-    collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufReader, Read, Write},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
+use rustc_hash::FxHashMap;
+
 use crate::{
-    error::{
-        KvError::{self, KeyNotFound},
-        Result,
-    },
+    error::{KvError, Result},
     record::{self, Command, Header},
 };
 
@@ -37,7 +35,7 @@ pub struct KvStore {
     // Lives as long as the store.
     file: File,
     // store's current state, held in memory.
-    data: HashMap<String, String>,
+    data: FxHashMap<String, String>,
     // Reused scratch buffer for encoding.
     buf: Vec<u8>,
     // Byte length of the log that replayed cleanly (where next append lands).
@@ -67,7 +65,7 @@ impl KvStore {
             TryLockError::Error(e) => e.into(),
         })?;
 
-        let mut data = HashMap::new();
+        let mut data = FxHashMap::default();
         let len = replay(&file, &mut data)?;
         let file_len = file.metadata()?.len();
         let dropped_bytes = file_len - len;
@@ -166,13 +164,13 @@ impl KvStore {
     /// Gets the string value of a given string key. Returns `KeyNotFound` if the
     /// given key doesn't exist.
     pub fn get(&self, key: &str) -> Result<String> {
-        self.data.get(key).cloned().ok_or(KeyNotFound)
+        self.data.get(key).cloned().ok_or(KvError::KeyNotFound)
     }
 
     /// Removes a given key.
     pub fn remove(&mut self, key: &str) -> Result<()> {
         if !self.data.contains_key(key) {
-            return Err(KeyNotFound);
+            return Err(KvError::KeyNotFound);
         }
 
         self.append(&Command::Rm { key })?;
@@ -193,7 +191,7 @@ impl Drop for KvStore {
 }
 
 /// Replays the whole log into memory.
-fn replay(reader: impl Read, data: &mut HashMap<String, String>) -> Result<u64> {
+fn replay(reader: impl Read, data: &mut FxHashMap<String, String>) -> Result<u64> {
     let mut reader = BufReader::with_capacity(READ_BUF_CAPACITY, reader);
     let mut header_buf = [0u8; Header::SIZE];
     let mut payload = Vec::new();
@@ -274,7 +272,7 @@ fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 
 /// Applies one command to the in-memory state, allocs only when a new key has to
 /// be inserted.
-fn apply(data: &mut HashMap<String, String>, cmd: Command<'_>) {
+fn apply(data: &mut FxHashMap<String, String>, cmd: Command<'_>) {
     match cmd {
         Command::Set { key, value } => match data.get_mut(key) {
             Some(slot) => {
@@ -307,8 +305,8 @@ mod tests {
         out
     }
 
-    fn run(reader: impl Read) -> Result<(HashMap<String, String>, u64)> {
-        let mut data = HashMap::new();
+    fn run(reader: impl Read) -> Result<(FxHashMap<String, String>, u64)> {
+        let mut data = FxHashMap::default();
         let len = replay(reader, &mut data)?;
         Ok((data, len))
     }
@@ -558,7 +556,7 @@ mod tests {
             Err(KvError::Io(_))
         ));
         assert!(store.poisoned);
-        assert!(matches!(store.get("b"), Err(KeyNotFound)));
+        assert!(matches!(store.get("b"), Err(KvError::KeyNotFound)));
         assert_eq!(
             fs::metadata(dir.path().join(LOG_FILE)).unwrap().len(),
             good_len
