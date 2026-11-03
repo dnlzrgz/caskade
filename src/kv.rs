@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -15,6 +15,8 @@ use crate::{
 pub const LOG_FILE: &str = "caskade.log";
 const READ_BUF_CAPACITY: usize = 64 * 1024;
 
+type Map = FxHashMap<Vec<u8>, Vec<u8>>;
+
 /// How often an append is followed by `File::sync_data`.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Durability {
@@ -28,14 +30,14 @@ pub enum Durability {
     Never,
 }
 
-/// The `KvStore` stores string key/value pairs.
+/// The `KvStore` stores byte keys and values.
 pub struct KvStore {
     // directory for the log and other data.
     _path: PathBuf,
     // Lives as long as the store.
     file: File,
     // store's current state, held in memory.
-    data: FxHashMap<String, String>,
+    data: Map,
     // Reused scratch buffer for encoding.
     buf: Vec<u8>,
     // Byte length of the log that replayed cleanly (where next append lands).
@@ -55,7 +57,7 @@ impl KvStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
@@ -65,13 +67,17 @@ impl KvStore {
             TryLockError::Error(e) => e.into(),
         })?;
 
+        let mut dropped_bytes = init_file_header(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+
         let mut data = FxHashMap::default();
         let len = replay(&file, &mut data)?;
         let file_len = file.metadata()?.len();
-        let dropped_bytes = file_len - len;
-        if dropped_bytes > 0 {
+        let torn = file_len - len;
+        if torn > 0 {
             file.set_len(len)?;
         }
+        dropped_bytes += torn;
 
         Ok(Self {
             _path: path,
@@ -149,9 +155,10 @@ impl KvStore {
         Ok(())
     }
 
-    /// Sets the value of a string key to a string. If the key already exists, the
+    /// Sets the value of a byte key to a byte value. If the key already exists, the
     /// previous value will be overwritten.
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    pub fn set(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
+        let (key, value) = (key.into(), value.into());
         self.append(&Command::Set {
             key: &key,
             value: &value,
@@ -161,14 +168,14 @@ impl KvStore {
         Ok(())
     }
 
-    /// Gets the string value of a given string key. Returns `KeyNotFound` if the
-    /// given key doesn't exist.
-    pub fn get(&self, key: &str) -> Result<String> {
+    /// Gets the value of a given key. Returns `KeyNotFound` if the given key
+    /// doesn't exist.
+    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         self.data.get(key).cloned().ok_or(KvError::KeyNotFound)
     }
 
     /// Removes a given key.
-    pub fn remove(&mut self, key: &str) -> Result<()> {
+    pub fn remove(&mut self, key: &[u8]) -> Result<()> {
         if !self.data.contains_key(key) {
             return Err(KvError::KeyNotFound);
         }
@@ -185,17 +192,42 @@ impl Drop for KvStore {
         // A `Periodic` store would otherwise never sync when the process appends
         // once and exits.
         if self.unsynced_appends > 0 {
-            let _ = self.file.sync_data();
+            let _ = self.sync();
         }
     }
 }
 
-/// Replays the whole log into memory.
-fn replay(reader: impl Read, data: &mut FxHashMap<String, String>) -> Result<u64> {
+/// Makes sure the log has at least a full file header.
+fn init_file_header(file: &mut File) -> Result<u64> {
+    let file_len = file.metadata()?.len();
+    if file_len >= record::FILE_HEADER_LEN as u64 {
+        return Ok(0);
+    }
+
+    let header = record::file_header();
+    let mut head = [0u8; record::FILE_HEADER_LEN];
+    let n = read_up_to(file, &mut head)?;
+    if head[..n] != header[..n] {
+        return Err(KvError::UnsupportedFormat("not a caskade log".to_owned()));
+    }
+
+    file.set_len(0)?;
+    file.write_all(&header)?;
+
+    Ok(file_len)
+}
+
+/// Replays the whole log into memory, starting after the file header.
+fn replay(reader: impl Read, data: &mut Map) -> Result<u64> {
     let mut reader = BufReader::with_capacity(READ_BUF_CAPACITY, reader);
     let mut header_buf = [0u8; Header::SIZE];
     let mut payload = Vec::new();
-    let mut offset = 0;
+
+    let mut file_header = [0u8; record::FILE_HEADER_LEN];
+    let n = read_up_to(&mut reader, &mut file_header)?;
+    record::check_file_header(&file_header[..n])?;
+
+    let mut offset = record::FILE_HEADER_LEN as u64;
 
     loop {
         let n = read_up_to(&mut reader, &mut header_buf)?;
@@ -272,15 +304,15 @@ fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 
 /// Applies one command to the in-memory state, allocs only when a new key has to
 /// be inserted.
-fn apply(data: &mut FxHashMap<String, String>, cmd: Command<'_>) {
+fn apply(data: &mut Map, cmd: Command<'_>) {
     match cmd {
         Command::Set { key, value } => match data.get_mut(key) {
             Some(slot) => {
                 slot.clear();
-                slot.push_str(value);
+                slot.extend_from_slice(value);
             }
             None => {
-                data.insert(key.to_owned(), value.to_owned());
+                data.insert(key.to_vec(), value.to_vec());
             }
         },
         Command::Rm { key } => {
@@ -296,7 +328,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn log_bytes(cmds: &[Command<'_>]) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = record::file_header().to_vec();
         let mut buf = Vec::new();
         for cmd in cmds {
             record::encode(cmd, &mut buf).unwrap();
@@ -305,37 +337,41 @@ mod tests {
         out
     }
 
-    fn run(reader: impl Read) -> Result<(FxHashMap<String, String>, u64)> {
+    fn run(reader: impl Read) -> Result<(Map, u64)> {
         let mut data = FxHashMap::default();
         let len = replay(reader, &mut data)?;
         Ok((data, len))
+    }
+
+    fn lookup<'a>(data: &'a Map, key: &str) -> &'a [u8] {
+        data.get(key.as_bytes()).map(Vec::as_slice).unwrap()
     }
 
     #[test]
     fn set_appends_one_decodable_record() -> Result<()> {
         let dir = TempDir::new().unwrap();
         let mut store = KvStore::open(dir.path())?;
-        store.set("key1".into(), "value1".into())?;
+        store.set("key1", "value1")?;
 
         let bytes = fs::read(dir.path().join(LOG_FILE)).unwrap();
-        let (cmd, consumed) = record::decode(&bytes)?;
+        let (cmd, consumed) = record::decode(&bytes[record::FILE_HEADER_LEN..])?;
         assert_eq!(
             cmd,
             Command::Set {
-                key: "key1",
-                value: "value1",
+                key: b"key1",
+                value: b"value1",
             }
         );
-        assert_eq!(consumed, bytes.len());
+        assert_eq!(consumed, bytes.len() - record::FILE_HEADER_LEN);
 
         Ok(())
     }
 
     #[test]
-    fn replay_empty_input_gives_empty_map() -> Result<()> {
-        let (data, len) = run(Cursor::new(Vec::new()))?;
+    fn replay_header_only_gives_empty_map() -> Result<()> {
+        let (data, len) = run(Cursor::new(record::file_header().to_vec()))?;
         assert!(data.is_empty());
-        assert_eq!(len, 0);
+        assert_eq!(len, record::FILE_HEADER_LEN as u64);
 
         Ok(())
     }
@@ -344,24 +380,24 @@ mod tests {
     fn replay_applies_commands_in_order() -> Result<()> {
         let bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
             Command::Set {
-                key: "a",
-                value: "3",
+                key: b"a",
+                value: b"3",
             },
-            Command::Rm { key: "b" },
+            Command::Rm { key: b"b" },
         ]);
         let total = bytes.len() as u64;
 
         let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 1);
-        assert_eq!(data["a"], "3");
+        assert_eq!(lookup(&data, "a"), b"3");
         assert_eq!(len, total);
 
         Ok(())
@@ -369,11 +405,18 @@ mod tests {
 
     #[test]
     fn replay_log_larger_than_read_buffer() -> Result<()> {
-        let mut bytes = Vec::new();
+        let mut bytes = record::file_header().to_vec();
         let mut buf = Vec::new();
         for i in 0..5000 {
             let (k, v) = (format!("key{i}"), format!("value{i}"));
-            record::encode(&Command::Set { key: &k, value: &v }, &mut buf).unwrap();
+            record::encode(
+                &Command::Set {
+                    key: k.as_bytes(),
+                    value: v.as_bytes(),
+                },
+                &mut buf,
+            )
+            .unwrap();
             bytes.extend_from_slice(&buf);
         }
         assert!(bytes.len() > READ_BUF_CAPACITY);
@@ -381,8 +424,8 @@ mod tests {
 
         let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 5000);
-        assert_eq!(data["key0"], "value0");
-        assert_eq!(data["key4999"], "value4999");
+        assert_eq!(lookup(&data, "key0"), b"value0");
+        assert_eq!(lookup(&data, "key4999"), b"value4999");
         assert_eq!(len, total);
 
         Ok(())
@@ -391,22 +434,18 @@ mod tests {
     #[test]
     fn replay_partial_header_recovers() -> Result<()> {
         let bytes = log_bytes(&[Command::Set {
-            key: "a",
-            value: "1",
+            key: b"a",
+            value: b"1",
         }]);
         let good_len = bytes.len() as u64;
 
-        // 3 stray bytes after one good record, then 3 bytes with nothing before them.
+        // A record header cut short by a crash.
         let mut tail = bytes.clone();
-        tail.extend_from_slice(&bytes[..3]);
+        tail.extend_from_slice(&[16, 0, 0]);
 
         let (data, len) = run(Cursor::new(tail))?;
-        assert_eq!(data["a"], "1");
+        assert_eq!(lookup(&data, "a"), b"1");
         assert_eq!(len, good_len);
-
-        let (data, len) = run(Cursor::new(bytes[..3].to_vec()))?;
-        assert!(data.is_empty());
-        assert_eq!(len, 0);
 
         Ok(())
     }
@@ -415,24 +454,24 @@ mod tests {
     fn replay_partial_payload_recovers() -> Result<()> {
         let mut bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
         ]);
         let good_len = log_bytes(&[Command::Set {
-            key: "a",
-            value: "1",
+            key: b"a",
+            value: b"1",
         }])
         .len() as u64;
         bytes.pop();
 
         let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 1);
-        assert_eq!(data["a"], "1");
+        assert_eq!(lookup(&data, "a"), b"1");
         assert_eq!(len, good_len);
 
         Ok(())
@@ -442,24 +481,24 @@ mod tests {
     fn replay_corrupt_final_record_recovers() -> Result<()> {
         let mut bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
         ]);
         let good_len = log_bytes(&[Command::Set {
-            key: "a",
-            value: "1",
+            key: b"a",
+            value: b"1",
         }])
         .len() as u64;
         *bytes.last_mut().unwrap() ^= 0x01;
 
         let (data, len) = run(Cursor::new(bytes))?;
         assert_eq!(data.len(), 1);
-        assert_eq!(data["a"], "1");
+        assert_eq!(lookup(&data, "a"), b"1");
         assert_eq!(len, good_len);
 
         Ok(())
@@ -469,15 +508,15 @@ mod tests {
     fn replay_bad_record_mid_log_is_corrupt() {
         let mut bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
         ]);
-        bytes[Header::SIZE] ^= 0x01;
+        bytes[record::FILE_HEADER_LEN + Header::SIZE] ^= 0x01;
 
         assert!(matches!(
             run(Cursor::new(bytes)),
@@ -489,16 +528,16 @@ mod tests {
     fn replay_damaged_header_mid_log_is_corrupt() {
         let mut bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
         ]);
         // Inflate the first record's length; the record's own tail is still intact.
-        bytes[0] ^= 0x01;
+        bytes[record::FILE_HEADER_LEN] ^= 0x01;
 
         assert!(matches!(
             run(Cursor::new(bytes)),
@@ -509,8 +548,8 @@ mod tests {
     #[test]
     fn replay_valid_checksum_with_unknown_tag_is_corrupt() {
         let mut bytes = log_bytes(&[Command::Set {
-            key: "a",
-            value: "1",
+            key: b"a",
+            value: b"1",
         }]);
         bytes.extend_from_slice(&record::frame(&[0x02]));
 
@@ -524,12 +563,12 @@ mod tests {
     fn replay_zero_filled_tail_recovers() -> Result<()> {
         let mut bytes = log_bytes(&[
             Command::Set {
-                key: "a",
-                value: "1",
+                key: b"a",
+                value: b"1",
             },
             Command::Set {
-                key: "b",
-                value: "2",
+                key: b"b",
+                value: b"2",
             },
         ]);
         let good_len = bytes.len() as u64;
@@ -556,7 +595,7 @@ mod tests {
             Err(KvError::Io(_))
         ));
         assert!(store.poisoned);
-        assert!(matches!(store.get("b"), Err(KvError::KeyNotFound)));
+        assert!(matches!(store.get(b"b"), Err(KvError::KeyNotFound)));
         assert_eq!(
             fs::metadata(dir.path().join(LOG_FILE)).unwrap().len(),
             good_len
@@ -613,7 +652,7 @@ mod tests {
         }
 
         let store = KvStore::open(dir.path())?;
-        assert_eq!(store.get("a")?, "1");
+        assert_eq!(store.get(b"a")?.as_slice(), b"1");
 
         Ok(())
     }

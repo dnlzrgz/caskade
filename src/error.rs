@@ -6,6 +6,8 @@ pub enum KvError {
     Io(#[from] std::io::Error),
     #[error("corrupt log record: {0}")]
     Corrupt(String),
+    #[error("unsupported log format: {0}")]
+    UnsupportedFormat(String),
     #[error("checksum mismatch")]
     ChecksumMismatch,
     #[error("record too large: {0} bytes")]

@@ -1,9 +1,11 @@
+use std::io::{self, Write};
+
 use clap::Parser;
 
 use caskade::{
     cli::{Cli, Commands},
     error::Result,
-    kv::{KvStore, LOG_FILE},
+    kv::{Durability, KvStore, LOG_FILE},
 };
 
 fn main() {
@@ -16,6 +18,13 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut store = KvStore::open(&cli.db)?;
+    if matches!(
+        &cli.command,
+        Commands::Set { sync: true, .. } | Commands::Rm { sync: true, .. }
+    ) {
+        store.set_durability(Durability::Always);
+    }
+
     let dropped = store.dropped_bytes();
     if dropped > 0 {
         let unit = if dropped == 1 { "byte" } else { "bytes" };
@@ -23,19 +32,13 @@ fn run() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Get { key } => println!("{}", store.get(&key)?),
-        Commands::Set { key, value, sync } => {
-            store.set(key, value)?;
-            if sync {
-                store.sync()?;
-            }
+        Commands::Get { key } => {
+            let mut out = io::stdout().lock();
+            out.write_all(&store.get(key.as_bytes())?)?;
+            out.write_all(b"\n")?;
         }
-        Commands::Rm { key, sync } => {
-            store.remove(&key)?;
-            if sync {
-                store.sync()?;
-            }
-        }
+        Commands::Set { key, value, .. } => store.set(key, value)?,
+        Commands::Rm { key, .. } => store.remove(key.as_bytes())?,
     }
 
     Ok(())

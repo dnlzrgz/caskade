@@ -2,9 +2,13 @@
 //! everything else treats records as opaque values.
 //!
 //! ```text
+//! file    := [magic "caskade\n"][version: u32 LE] record*
 //! record  := [len: u32 LE][crc: u32 LE][hcrc: u32 LE][payload]
-//! payload := tag u8 | key_len u32 LE | key | value_len u32 LE | value
-//! tag     := 0x00 Set | 0x01 Rm (value_len = 0, no value bytes)
+//! payload := tag u8 | key_len: varint | key | value   (Set: value is the rest)
+//! payload := tag u8 | key_len: varint | key           (Rm)
+//! tag     := 0x00 Set | 0x01 Rm
+//! varint  := unsigned LEB128, at most 4 bytes
+//! key, value := opaque bytes (no encoding is assumed)
 //! crc     := CRC-32 of payload only
 //! hcrc    := CRC-32 of [len][crc]. Without it a damaged length cannot be told
 //!            apart from a payload cut short by a crash, and replay would throw
@@ -12,7 +16,6 @@
 //! len     := payload length, so a record spans HEADER_LEN + len bytes
 //! ```
 //!
-//! The layout is not versioned: changing it makes existing logs unreadable.
 
 use crate::error::{KvError, Result};
 
@@ -20,6 +23,12 @@ use crate::error::{KvError, Result};
 const MAX_RECORD: usize = 64 << 20; // 64 MiB
 /// Size of [len][crc][hcrc].
 const HEADER_LEN: usize = 12;
+/// File marker, followed by a `u32` version.
+const MAGIC: [u8; 8] = *b"caskade\n";
+/// Size of [magic][version], the prefix every log starts with.
+pub(crate) const FILE_HEADER_LEN: usize = MAGIC.len() + 4;
+/// Bumped whenever the bytes above change meaning.
+pub(crate) const VERSION: u32 = 1;
 
 const TAG_SET: u8 = 0x00;
 const TAG_RM: u8 = 0x01;
@@ -42,8 +51,8 @@ impl Tag {
 /// One log entry (verb + operands)
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command<'a> {
-    Set { key: &'a str, value: &'a str },
-    Rm { key: &'a str },
+    Set { key: &'a [u8], value: &'a [u8] },
+    Rm { key: &'a [u8] },
 }
 
 /// A parsed record header.
@@ -90,10 +99,44 @@ impl Header {
     }
 }
 
+/// The prefix an empty log is started with.
+pub(crate) fn file_header() -> [u8; FILE_HEADER_LEN] {
+    let mut head = [0u8; FILE_HEADER_LEN];
+    head[..MAGIC.len()].copy_from_slice(&MAGIC);
+    head[MAGIC.len()..].copy_from_slice(&VERSION.to_le_bytes());
+
+    head
+}
+
+/// Accepts only a log this build knows how to read.
+pub(crate) fn check_file_header(head: &[u8]) -> Result<()> {
+    if head.len() < FILE_HEADER_LEN {
+        return Err(KvError::UnsupportedFormat(format!(
+            "truncated file header: {} bytes",
+            head.len()
+        )));
+    }
+    if head[..MAGIC.len()] != MAGIC {
+        return Err(KvError::UnsupportedFormat("not a caskade log".to_owned()));
+    }
+    let version = head
+        .get(MAGIC.len()..FILE_HEADER_LEN)
+        .and_then(|rest| rest.first_chunk::<4>())
+        .ok_or_else(|| KvError::UnsupportedFormat("truncated file header".to_owned()))?;
+    let version = u32::from_le_bytes(*version);
+    if version != VERSION {
+        return Err(KvError::UnsupportedFormat(format!(
+            "log format version {version}, expected {VERSION}"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
     let payload_len = match cmd {
-        Command::Set { key, value } => 1 + 4 + key.len() + 4 + value.len(),
-        Command::Rm { key } => 1 + 4 + key.len() + 4,
+        Command::Set { key, value } => 1 + varint_len(key.len()) + key.len() + value.len(),
+        Command::Rm { key } => 1 + varint_len(key.len()) + key.len(),
     };
     if payload_len > MAX_RECORD {
         // Nothing has been touched, so the caller's buffer is unchanged.
@@ -104,21 +147,18 @@ pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
     buf.reserve(HEADER_LEN + payload_len);
     buf.extend_from_slice(&[0; HEADER_LEN]);
 
-    match cmd {
-        Command::Set { key, value } => {
-            buf.push(TAG_SET);
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            buf.extend_from_slice(value.as_bytes());
-        }
-        Command::Rm { key } => {
-            buf.push(TAG_RM);
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(&0u32.to_le_bytes());
-        }
+    let (tag, key, value) = match cmd {
+        Command::Set { key, value } => (TAG_SET, *key, Some(*value)),
+        Command::Rm { key } => (TAG_RM, *key, None),
+    };
+    buf.push(tag);
+    // The check above bounds every field, so this cannot truncate.
+    put_varint(key.len() as u32, buf);
+    buf.extend_from_slice(key);
+    if let Some(value) = value {
+        buf.extend_from_slice(value);
     }
+    debug_assert_eq!(buf.len(), HEADER_LEN + payload_len);
 
     let crc = crc32fast::hash(&buf[HEADER_LEN..]);
     buf[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
@@ -144,23 +184,18 @@ pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Comman
     pos += 1;
     let tag = Tag::from_byte(tag)?;
 
-    let key = take_str(payload, &mut pos)?;
+    let key = take_bytes(payload, &mut pos)?;
     let cmd = match tag {
-        Tag::Set => Command::Set {
-            key,
-            value: take_str(payload, &mut pos)?,
-        },
-        Tag::Rm => {
-            // Rm still carries the field; a non-zero length means a broken writer.
-            if take_u32(payload, &mut pos)? != 0 {
-                return Err(KvError::Corrupt(
-                    "Rm record with non-empty value".to_owned(),
-                ));
-            }
-            Command::Rm { key }
+        Tag::Set => {
+            // No value length: the value is whatever is left.
+            let value = &payload[pos..];
+            pos = payload.len();
+            Command::Set { key, value }
         }
+        Tag::Rm => Command::Rm { key },
     };
 
+    // Only `Rm` can leave a tail, and a writer never does.
     if pos != payload.len() {
         return Err(KvError::Corrupt(format!(
             "{} trailing bytes in record",
@@ -171,18 +206,44 @@ pub(crate) fn decode_payload(payload: &[u8], expected_crc: u32) -> Result<Comman
     Ok(cmd)
 }
 
-fn take_u32(payload: &[u8], pos: &mut usize) -> Result<u32> {
-    let n = payload
-        .get(*pos..)
-        .and_then(|rest| rest.first_chunk::<4>())
-        .ok_or_else(|| KvError::Corrupt("truncated length field".to_owned()))?;
-    *pos += 4;
-
-    Ok(u32::from_le_bytes(*n))
+/// Unsigned LEB128: one byte below 128, one more per 7 bits after that.
+fn put_varint(mut n: u32, buf: &mut Vec<u8>) {
+    while n >= 0x80 {
+        buf.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    buf.push(n as u8);
 }
 
-fn take_str<'a>(payload: &'a [u8], pos: &mut usize) -> Result<&'a str> {
-    let len = take_u32(payload, pos)? as usize;
+const fn varint_len(mut n: usize) -> usize {
+    let mut len = 1;
+    while n >= 0x80 {
+        n >>= 7;
+        len += 1;
+    }
+
+    len
+}
+
+/// Reads a varint of at most 4 bytes, which bounds it below `u32::MAX`.
+fn take_varint(payload: &[u8], pos: &mut usize) -> Result<u32> {
+    let mut n = 0u32;
+    for shift in [0, 7, 14, 21] {
+        let byte = *payload
+            .get(*pos)
+            .ok_or_else(|| KvError::Corrupt("truncated length field".to_owned()))?;
+        *pos += 1;
+        n |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+
+    Err(KvError::Corrupt("length field too long".to_owned()))
+}
+
+fn take_bytes<'a>(payload: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    let len = take_varint(payload, pos)? as usize;
     let end = pos
         .checked_add(len)
         .ok_or_else(|| KvError::Corrupt("length overflow".to_owned()))?;
@@ -191,7 +252,7 @@ fn take_str<'a>(payload: &'a [u8], pos: &mut usize) -> Result<&'a str> {
         .ok_or_else(|| KvError::Corrupt(format!("truncated field: need {len} bytes")))?;
     *pos = end;
 
-    std::str::from_utf8(chunk).map_err(|_| KvError::Corrupt("invalid utf-8 in record".to_owned()))
+    Ok(chunk)
 }
 
 #[cfg(test)]
@@ -230,8 +291,8 @@ mod tests {
 
     fn sample() -> Command<'static> {
         Command::Set {
-            key: "ab",
-            value: "c",
+            key: b"ab",
+            value: b"c",
         }
     }
 
@@ -249,18 +310,22 @@ mod tests {
         let mut buf = Vec::new();
         let records = [
             Command::Set {
-                key: "k",
-                value: "v",
+                key: b"k",
+                value: b"v",
             },
             Command::Set {
-                key: "e",
-                value: "",
+                key: b"e",
+                value: b"",
             },
             Command::Set {
-                key: "ü",
-                value: "€",
+                key: "ü".as_bytes(),
+                value: "€".as_bytes(),
             },
-            Command::Rm { key: "k" },
+            Command::Set {
+                key: b"\xff\xfe",
+                value: b"\x00\x80\xff",
+            },
+            Command::Rm { key: b"k" },
         ];
         for cmd in &records {
             encode(cmd, &mut buf).unwrap();
@@ -287,7 +352,7 @@ mod tests {
     #[test]
     fn encode_rejects_oversized_record_and_leaves_buf_alone() {
         let mut buf = vec![1, 2, 3];
-        let key = "a".repeat(MAX_RECORD);
+        let key = vec![b'a'; MAX_RECORD];
         let cmd = Command::Rm { key: &key };
         assert!(matches!(
             encode(&cmd, &mut buf),
@@ -320,6 +385,39 @@ mod tests {
     fn max_record_len_is_accepted_by_header() {
         let h = header_bytes(MAX_RECORD);
         assert_eq!(Header::decode(&h).unwrap().payload_len, MAX_RECORD);
+    }
+
+    #[test]
+    fn file_header_is_accepted() {
+        assert!(check_file_header(&file_header()).is_ok());
+    }
+
+    #[test]
+    fn file_header_with_other_magic_is_unsupported() {
+        let mut head = file_header();
+        head[0] = b'x';
+        assert!(matches!(
+            check_file_header(&head),
+            Err(KvError::UnsupportedFormat(m)) if m.contains("not a caskade log")
+        ));
+    }
+
+    #[test]
+    fn file_header_with_other_version_is_unsupported() {
+        let mut head = file_header();
+        head[MAGIC.len()..].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            check_file_header(&head),
+            Err(KvError::UnsupportedFormat(m)) if m.contains("version 2, expected 1")
+        ));
+    }
+
+    #[test]
+    fn short_file_header_is_unsupported() {
+        assert!(matches!(
+            check_file_header(&file_header()[..FILE_HEADER_LEN - 1]),
+            Err(KvError::UnsupportedFormat(m)) if m.starts_with("truncated file header")
+        ));
     }
 
     #[test]
@@ -359,7 +457,7 @@ mod tests {
     #[test]
     fn field_longer_than_payload_is_corrupt() {
         let mut p = vec![TAG_SET];
-        p.extend_from_slice(&5u32.to_le_bytes());
+        p.push(5); // key_len varint
         p.push(b'k');
         assert!(matches!(
             decode(&frame(&p)),
@@ -368,29 +466,53 @@ mod tests {
     }
 
     #[test]
-    fn rm_with_non_empty_value_is_corrupt() {
+    fn overlong_length_field_is_corrupt() {
         let mut p = vec![TAG_RM];
-        p.extend_from_slice(&1u32.to_le_bytes());
-        p.push(b'k');
-        p.extend_from_slice(&1u32.to_le_bytes());
-        p.push(b'x');
+        p.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
         assert!(matches!(
             decode(&frame(&p)),
-            Err(KvError::Corrupt(m)) if m.contains("non-empty value")
+            Err(KvError::Corrupt(m)) if m.starts_with("length field too long")
         ));
     }
 
     #[test]
-    fn trailing_garbage_with_valid_crc_is_corrupt() {
-        let mut payload = vec![TAG_SET];
-        payload.extend_from_slice(&1u32.to_le_bytes());
-        payload.push(b'k');
-        payload.extend_from_slice(&1u32.to_le_bytes());
-        payload.extend_from_slice(b"v!");
+    fn rm_with_trailing_bytes_is_corrupt() {
+        let mut p = vec![TAG_RM];
+        p.push(1);
+        p.extend_from_slice(b"kx");
         assert!(matches!(
-            decode(&frame(&payload)),
+            decode(&frame(&p)),
             Err(KvError::Corrupt(m)) if m.contains("trailing bytes")
         ));
+    }
+
+    /// A `Set` has no value length, so anything after the key is value bytes.
+    #[test]
+    fn set_value_is_the_rest_of_the_payload() {
+        let mut p = vec![TAG_SET];
+        p.push(1);
+        p.extend_from_slice(b"kvv");
+        let record = frame(&p);
+        let (cmd, _) = decode(&record).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: b"k",
+                value: b"vv",
+            }
+        );
+    }
+
+    /// A key that fits one byte must not pay for two.
+    #[test]
+    fn key_len_varint_width_grows_with_the_key() {
+        for (key_len, len_bytes) in [(0, 1), (127, 1), (128, 2), (16_383, 2), (16_384, 3)] {
+            let key = vec![b'k'; key_len];
+            let mut buf = Vec::new();
+            encode(&Command::Rm { key: &key }, &mut buf).unwrap();
+            // header + tag + key_len + key, and `Rm` carries nothing else.
+            assert_eq!(buf.len(), HEADER_LEN + 1 + len_bytes + key_len);
+        }
     }
 
     #[test]
@@ -413,27 +535,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn invalid_utf8_is_corrupt() {
-        let mut p = vec![TAG_RM];
-        p.extend_from_slice(&1u32.to_le_bytes());
-        p.push(0xFF);
-        p.extend_from_slice(&0u32.to_le_bytes());
-        assert!(matches!(
-            decode(&frame(&p)),
-            Err(KvError::Corrupt(m)) if m.starts_with("invalid utf-8")
-        ));
-    }
-
-    /// Keys and values up to 32 chars: enough for empty, ASCII and multi-byte cases,
-    /// small enough that the default 256 cases stay well under a second.
-    fn any_str() -> impl Strategy<Value = String> {
-        prop::collection::vec(prop::char::any(), 0..32).prop_map(String::from_iter)
+    /// Keys and values up to 32 arbitrary bytes: empty, ASCII, and non-UTF-8 cases.
+    fn any_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..32)
     }
 
     proptest! {
         #[test]
-        fn encode_decode_round_trip(key in any_str(), value in any_str()) {
+        fn encode_decode_round_trip(key in any_bytes(), value in any_bytes()) {
             let mut buf = Vec::new();
             for cmd in [
                 Command::Set {
@@ -452,9 +561,9 @@ mod tests {
         /// A longer record encoded first must not leave bytes behind for the next one.
         #[test]
         fn reused_buffer_matches_a_fresh_one(
-            key in any_str(),
-            value in any_str(),
-            other in any_str(),
+            key in any_bytes(),
+            value in any_bytes(),
+            other in any_bytes(),
         ) {
             let mut reused = Vec::new();
             encode(
@@ -490,8 +599,8 @@ mod tests {
         /// Hostile edits of a valid record are rejected, never a panic.
         #[test]
         fn mutated_record_is_rejected_not_panicked(
-            key in any_str(),
-            value in any_str(),
+            key in any_bytes(),
+            value in any_bytes(),
             at in 0usize..64,
             mask in any::<u8>(),
             cut in 0usize..64,

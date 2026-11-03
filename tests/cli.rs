@@ -21,7 +21,7 @@ fn set_sync_persists() {
         .success();
 
     let store = KvStore::open(temp_dir.path()).unwrap();
-    assert_eq!(store.get("key1").unwrap(), "value1");
+    assert_eq!(store.get(b"key1").unwrap().as_slice(), b"value1");
 }
 
 // Should remove a key with `--sync`.
@@ -42,7 +42,7 @@ fn rm_sync_removes() {
         .success();
 
     let store = KvStore::open(temp_dir.path()).unwrap();
-    assert!(matches!(store.get("key1"), Err(KvError::KeyNotFound)));
+    assert!(matches!(store.get(b"key1"), Err(KvError::KeyNotFound)));
 }
 
 // Should print the value and exit 0.
@@ -130,6 +130,27 @@ fn db_option_addresses_another_store() {
         .success();
 
     let store = KvStore::open(store_dir.path()).unwrap();
-    assert_eq!(store.get("key1").unwrap(), "value1");
+    assert_eq!(store.get(b"key1").unwrap().as_slice(), b"value1");
     assert!(!cwd.path().join(LOG_FILE).exists());
+}
+
+// Should print a binary value unchanged, byte for byte.
+#[test]
+fn get_prints_binary_value() {
+    let temp_dir = TempDir::new().expect("unable to create temp working dir");
+    let value = vec![0xFF, 0x00, 0x80, b'\n', 0xC3];
+    {
+        let mut store = KvStore::open(temp_dir.path()).unwrap();
+        store.set("key1", value.clone()).unwrap();
+    }
+
+    let mut expected = value;
+    expected.push(b'\n');
+    Command::cargo_bin("caskade")
+        .unwrap()
+        .current_dir(temp_dir.path())
+        .args(["get", "key1"])
+        .assert()
+        .success()
+        .stdout(expected);
 }

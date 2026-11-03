@@ -15,6 +15,8 @@ const RECORDS: usize = 1_000_000;
 const APPEND_BATCH: usize = 10_000;
 /// Records per iteration when the policy syncs.
 const SYNC_APPEND_BATCH: usize = 500;
+/// Distinct keys a get benchmark cycles through, spread over the whole key space.
+const GET_SAMPLES: usize = 100_000;
 
 /// Builds a log once by calling `set` into a temp dir.
 fn build_log(records: usize, key_space: usize) -> TempDir {
@@ -25,6 +27,7 @@ fn build_log(records: usize, key_space: usize) -> TempDir {
             .set(format!("key{}", i % key_space), format!("value{i}"))
             .unwrap();
     }
+
     dir
 }
 
@@ -52,6 +55,29 @@ fn bench_replay(c: &mut Criterion) {
 
         drop(dir);
     }
+
+    group.finish();
+}
+
+fn bench_get(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get");
+    group.sample_size(50);
+
+    let key_space = RECORDS * 9 / 10;
+    let dir = build_log(RECORDS, key_space);
+    let store = KvStore::open(dir.path()).unwrap();
+    let keys: Vec<String> = (0..GET_SAMPLES)
+        .map(|i| format!("key{}", i * key_space / GET_SAMPLES))
+        .collect();
+    let mut next = 0;
+
+    group.bench_function("hit", |b| {
+        b.iter(|| {
+            let key = &keys[next % keys.len()];
+            next += 1;
+            black_box(store.get(key.as_bytes()).unwrap());
+        });
+    });
 
     group.finish();
 }
@@ -129,5 +155,11 @@ fn bench_append_durability(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_replay, bench_append, bench_append_durability);
+criterion_group!(
+    benches,
+    bench_replay,
+    bench_get,
+    bench_append,
+    bench_append_durability
+);
 criterion_main!(benches);
