@@ -1,5 +1,3 @@
-//! Benchmarks for `KvStore` replay and append.
-
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -36,7 +34,8 @@ fn bench_replay(c: &mut Criterion) {
     group.sample_size(20);
     group.throughput(Throughput::Elements(RECORDS as u64));
 
-    for (name, key_space) in [("distinct", RECORDS * 9 / 10), ("overwrite", 100)] {
+    // `bounded` measures replay of a log compaction.
+    for (name, key_space) in [("distinct", RECORDS * 9 / 10), ("bounded", 100)] {
         let dir = build_log(RECORDS, key_space);
         let path = dir.path().to_path_buf();
 
@@ -155,11 +154,28 @@ fn bench_append_durability(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_compaction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compaction");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements((RECORDS * 9 / 10) as u64));
+
+    let dir = build_log(RECORDS, RECORDS * 9 / 10);
+    let mut store = KvStore::open(dir.path()).unwrap();
+    // Every iteration rewrites all live records into a new segment, so this is the
+    // pause a merge costs on the write path; it does not shrink as the log ages.
+    group.bench_function("merge", |b| {
+        b.iter(|| store.compact().unwrap());
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_replay,
     bench_get,
     bench_append,
-    bench_append_durability
+    bench_append_durability,
+    bench_compaction
 );
 criterion_main!(benches);

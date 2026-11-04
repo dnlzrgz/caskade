@@ -5,7 +5,7 @@ use clap::Parser;
 use caskade::{
     cli::{Cli, Commands},
     error::Result,
-    kv::{Durability, KvStore, LOG_FILE},
+    kv::{Durability, KvStore},
 };
 
 fn main() {
@@ -28,7 +28,7 @@ fn run() -> Result<()> {
     let dropped = store.dropped_bytes();
     if dropped > 0 {
         let unit = if dropped == 1 { "byte" } else { "bytes" };
-        eprintln!("caskade: dropped {dropped} {unit} of torn tail from {LOG_FILE}");
+        eprintln!("caskade: dropped {dropped} {unit} of torn tail");
     }
 
     match cli.command {
@@ -39,6 +39,14 @@ fn run() -> Result<()> {
         }
         Commands::Set { key, value, .. } => store.set(key, value)?,
         Commands::Rm { key, .. } => store.remove(key.as_bytes())?,
+        Commands::Compact => store.compact()?,
+        Commands::Stats => {
+            let mut out = io::stdout().lock();
+            writeln!(out, "keys: {}", store.key_count())?;
+            writeln!(out, "segments: {}", store.segment_count())?;
+            writeln!(out, "log_bytes: {}", store.log_bytes())?;
+            writeln!(out, "stale_bytes: {}", store.stale_bytes())?;
+        }
     }
 
     Ok(())

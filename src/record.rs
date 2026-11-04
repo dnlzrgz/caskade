@@ -20,7 +20,7 @@
 use crate::error::{KvError, Result};
 
 /// Largest payload accepted.
-const MAX_RECORD: usize = 64 << 20; // 64 MiB
+pub(crate) const MAX_RECORD: usize = 64 << 20; // 64 MiB
 /// Size of [len][crc][hcrc].
 const HEADER_LEN: usize = 12;
 /// File marker, followed by a `u32` version.
@@ -61,6 +61,15 @@ pub(crate) struct Header {
     pub(crate) payload_len: usize,
     /// CRC-32 the payload must match.
     pub(crate) crc: u32,
+}
+
+impl Command<'_> {
+    /// Length of the key, whatever the verb is.
+    pub(crate) fn key_len(&self) -> usize {
+        match self {
+            Command::Set { key, .. } | Command::Rm { key } => key.len(),
+        }
+    }
 }
 
 impl Header {
@@ -106,6 +115,18 @@ pub(crate) fn file_header() -> [u8; FILE_HEADER_LEN] {
     head[MAGIC.len()..].copy_from_slice(&VERSION.to_le_bytes());
 
     head
+}
+
+/// Bytes one record occupies in the log, header included. An `Rm` has no value
+/// field, so `record_len(key_len, 0)` is its size too.
+pub(crate) fn record_len(key_len: usize, value_len: usize) -> usize {
+    HEADER_LEN + 1 + varint_len(key_len) + key_len + value_len
+}
+
+/// Offset of the value bytes of a record that starts at `record_pos`: where an
+/// `Rm` of the same key would have ended.
+pub(crate) fn value_offset(record_pos: u64, key_len: usize) -> u64 {
+    record_pos + record_len(key_len, 0) as u64
 }
 
 /// Accepts only a log this build knows how to read.
@@ -622,6 +643,32 @@ mod tests {
         #[test]
         fn arbitrary_payload_never_panics(payload in prop::collection::vec(any::<u8>(), 0..256)) {
             let _ = decode_payload(&payload, crc32fast::hash(&payload));
+        }
+    }
+
+    /// The index adds these sizes up instead of reading records back, so they have
+    /// to agree with `encode` at every varint width.
+    #[test]
+    fn record_len_matches_encode() {
+        for (key_len, value_len) in [(0, 0), (1, 1), (127, 0), (128, 300), (16383, 1), (16384, 2)] {
+            let key = vec![b'k'; key_len];
+            let value = vec![b'v'; value_len];
+
+            let mut set = Vec::new();
+            encode(
+                &Command::Set {
+                    key: &key,
+                    value: &value,
+                },
+                &mut set,
+            )
+            .unwrap();
+            assert_eq!(set.len(), record_len(key_len, value_len));
+            assert_eq!(&set[value_offset(0, key_len) as usize..], &value[..]);
+
+            let mut rm = Vec::new();
+            encode(&Command::Rm { key: &key }, &mut rm).unwrap();
+            assert_eq!(rm.len(), record_len(key_len, 0));
         }
     }
 }

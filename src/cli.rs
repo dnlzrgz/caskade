@@ -15,9 +15,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Get {
-        key: String,
-    },
+    /// Print the value of a key.
+    Get { key: String },
+    /// Set a key to a value.
     Set {
         key: String,
         value: String,
@@ -25,10 +25,15 @@ pub enum Commands {
         #[arg(long)]
         sync: bool,
     },
+    /// Remove a key.
     Rm {
         key: String,
         /// Sync to disk before exiting.
         #[arg(long)]
         sync: bool,
     },
+    /// Rewrite the log with live records only.
+    Compact,
+    /// Print the size and shape of the log.
+    Stats,
 }
