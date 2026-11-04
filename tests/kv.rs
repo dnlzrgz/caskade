@@ -124,7 +124,7 @@ fn get_stored_value() -> Result<()> {
     Ok(())
 }
 
-// Should overwrite existent value.
+// Should overwrite existing value.
 #[test]
 fn overwrite_existing_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");

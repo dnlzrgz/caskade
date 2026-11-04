@@ -445,7 +445,7 @@ impl KvStore {
     }
 
     /// Compacts the log when the bytes nothing points at have grown enough to
-    /// make worth the copy.
+    /// make it worth the copy.
     fn maybe_compact(&mut self) {
         if self.stale < self.compact_min_stale
             || self.stale < self.compact_retry_at
@@ -659,7 +659,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Collects the segments in `dir`. Delets temp files a crash may had left behind too.
+/// Collects the segments in `dir`. Deletes temp files a crash may have left behind too.
 fn scan(dir: &Path) -> Result<BTreeMap<u32, Kind>> {
     let mut segments = BTreeMap::new();
     for entry in fs::read_dir(dir)? {
