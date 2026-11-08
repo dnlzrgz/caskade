@@ -1,12 +1,12 @@
 use std::{
-    cell::Cell,
     collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    marker::PhantomData,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+use std::os::unix::fs::FileExt;
 
 use rustc_hash::FxHashMap;
 
@@ -150,9 +150,6 @@ pub struct KvStore {
     last_sync: Instant,
     // Set when a write or sync failed: store must be reopened.
     poisoned: bool,
-    // `get` seeks the segment's shared cursor, so two threads must not read at
-    // once. Marking the store `!Sync` keeps that from happening silently.
-    _not_sync: PhantomData<Cell<()>>,
     // Fails the merge right after its rename, so the poisoning path is testable.
     #[cfg(test)]
     fail_after_rename: bool,
@@ -241,7 +238,6 @@ impl KvStore {
             unsynced_appends: 0,
             last_sync: Instant::now(),
             poisoned: false,
-            _not_sync: PhantomData,
             #[cfg(test)]
             fail_after_rename: false,
         })
@@ -413,16 +409,15 @@ impl KvStore {
         self.read_value(entry)
     }
 
-    /// Reads one value out of the segment that holds it.
+    /// Reads one value out of the segment that holds it. A positioned read keeps
+    /// the shared handle's cursor intact so concurrent `get`s cannot collide.
     fn read_value(&self, entry: &Entry) -> Result<Vec<u8>> {
         let file = self
             .files
             .get(&entry.file_id)
             .ok_or_else(|| KvError::Corrupt(format!("segment {} is missing", entry.file_id)))?;
         let mut value = vec![0u8; entry.value_len as usize];
-        let mut file = file;
-        file.seek(SeekFrom::Start(entry.value_pos))?;
-        file.read_exact(&mut value)?;
+        file.read_exact_at(&mut value, entry.value_pos)?;
 
         Ok(value)
     }
@@ -571,7 +566,7 @@ impl KvStore {
                 .get(&id)
                 .ok_or_else(|| KvError::Corrupt(format!("segment {id} is missing")))?;
 
-            // The handle is shared with `get`, so its cursor is wherever that left it.
+            // Appends left the cursor at the end; start from the first record.
             file.seek(SeekFrom::Start(record::FILE_HEADER_LEN as u64))?;
             let mut offset = record::FILE_HEADER_LEN as u64;
             let mut next = 0;
@@ -648,13 +643,7 @@ fn create_segment(dir: &Path, id: u32) -> Result<File> {
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()?;
-    }
-
-    #[cfg(not(unix))]
-    let _ = dir;
+    File::open(dir)?.sync_all()?;
 
     Ok(())
 }

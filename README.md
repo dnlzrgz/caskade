@@ -19,7 +19,7 @@ After "finishing" the tutorial, I kept going:
 - Segment files, so the log does not have to be one ever-growing file.
 - `stats`, criterion benchmarks and property testing.
 
-The end result is still a small project: around 2,000 lines of code. One writer, no background threads (at least for now).
+The end result is still a small project: around 2,000 lines of code.
 
 ## AI usage
 
@@ -27,11 +27,11 @@ AI assistance was used only for research, testing, and documentation.
 
 ## Features
 
-- Append-only log with 64 MiB segments (configurable through `Options`).
+- Append-only log with 64 MiB segments (configurable via `Options`).
 - In-memory offset index. Values stay on disk and are read on demand.
-- Automatic and explicit compaction, with stale-byte accounting.
+- Automatic and explicit compaction.
 - Torn-tail recovery.
-- Durability policies: `Always`, `Periodic`, `Never`, plus an explicit `sync()`.
+- Durability policies: `Always`, `Periodic`, `Never`, plus explicit `sync()`.
 - Versioned on-disk format.
 - CLI (`get`, `set`, `rm`, `compact`, `stats`) and a library API.
 
@@ -72,49 +72,48 @@ fn main() -> Result<(), KvError> {
 }
 ```
 
+## Performance
+
+Criterion benchmarks on a 13th Gen Intel Core i7-13650HX (20 threads), Linux. Release profile with `lto = "fat"`, `codegen-units = 1`, page cache warm.Times are criterion's point estimates and you can expect roughly +/-5% between runs.
+
+| Benchmark | Workload | Time | Rate |
+| --- | --- | --- | --- |
+| `replay/distinct` | open and replay 1M records / 900k keys | 140.8 ms | 7.1M records/s |
+| `replay/bounded` | open and replay the ~1 MiB log left by 1M overwrites of 100 keys | 474.0 µs | - |
+| `get/hit` | one `get` over 100k keys from a 900k-key store | 371.4 ns | 2.7M gets/s |
+| `append/set` | 10,000 `set`s, default `Durability::Never` | 7.55 ms | 1.32M writes/s (755 ns each) |
+| `append_durability/periodic_100_writes` | 500 `set`s, fsync every 100 writes | 8.72 ms | 57k writes/s |
+| `append_durability/always` | 500 `set`s, fsync per write | 605.3 ms | 826 writes/s (1.21 ms each) |
+| `compaction/merge` | full merge of 900k live records | 512.1 ms | 1.76M records/s |
+
+Reading the table:
+
+- Replay is the number that affects startup time. It is map-bound, not
+  parsing-bound: 1M records into a 900k-entry map takes 141 ms.
+- A `get` is a hash lookup plus one positioned read.
+- Appends cost 755 ns each with no fsync. `always` costs 1.21 ms per write on this disk, so fsync is ~99% of the write cost. `periodic` amortizes it.
+- A merge rewrites the entire live set, so its cost is the pause a compaction causes: about 0.5 s per 900k live keys.
+
 ## Design decisions
 
 **Binary log, not a serialization framework.** Records are hand-encoded: a 12-byte header (`len`, `crc`, `hcrc`), then a tag, a LEB128 key length, the key and the value (see [On-disk format](#on-disk-format)). The header checksum is the interesting part: without it, a damaged length cannot be told apart from a payload cut short by a crash, and replay would throw away the good records behind it.
 
-**An offset index, not a value cache.** The map holds `key -> (segment, value offset, value length)` in a 16-byte entry, using `rustc_hash::FxHashMap`. A `get` is a hash lookup, a seek and a read. Memory grows with the number of keys, not the bytes stored, at the cost of a disk read per hit (473 ns instead of ~57 ns when values lived in memory).
+**An offset index, not a value cache.** The map holds `key -> (segment, value offset, value length)` in a 16-byte entry, using `rustc_hash::FxHashMap`. A `get` is a hash lookup and one positioned read. Memory grows with the number of keys, not the bytes stored, at the cost of a disk read per hit (371 ns instead of ~57 ns when values lived in memory).
 
 **Segments and merge-all compaction.** The log is split into `caskade.log.<id>` files and appends go to the highest id. A merge rewrites every live record into `caskade.log.<next>.m`, fsyncs it, renames it, and only then deletes the old files. The `.m` marker means "this supersedes every lower id", which is what makes dropping tombstones safe and a crash during cleanup harmless. Merging everything is the simplest correct version, and it caps write amplification at about 2x because a merge only triggers once stale bytes reach live bytes. The price is a pause: a merge is synchronous and rewrites the whole live set.
 
 **Failures are handled on purpose.** A failed append truncates back to the last good record. A failed merge before the rename leaves the old log untouched. A failure after the rename poisons the store instead of appending to files the next open would delete. Rotation fsyncs the segment it seals, because `open` only tolerates a torn tail in the highest id.
 
-**Durability is a policy, not a promise.** The default is `Never` (the same choice bitcask and RocksDB make): bytes reach the OS, not the disk. `Always` fsyncs every write, `Periodic` spreads the fsync cost over several writes, and `sync()` forces one. `Drop` flushes pending `Periodic` appends, so a one-write process still syncs.
+**Durability is not promised.** The default is `Never` (the same choice bitcask and RocksDB make): bytes reach the OS, not the disk. `Always` fsyncs every write, `Periodic` spreads the fsync cost over several writes, and `sync()` forces one. `Drop` flushes pending `Periodic` appends, so a one-write process still syncs.
 
-**One writer, and say so.** `KvStore` is `!Sync` on purpose: `get` seeks the segment's shared file cursor, so two threads reading at once would read each other's offsets. An advisory file lock on `caskade.lock` keeps two processes apart, and the kernel releases it when the process dies, so there is no stale lock to clean up.
-
-## Performance
-
-Criterion benchmarks on a 13th Gen Intel Core i7-13650HX (20 threads), Linux. Release profile with `lto = "fat"`, `codegen-units = 1`. Page cache is warm. Medians of one run; you can expect roughly +/-5% between runs.
-
-| Benchmark | Workload | Median | Rate |
-| --- | --- | --- | --- |
-| `replay/distinct` | open and replay 1M records / 900k keys | 124.3 ms | 8.0M records/s |
-| `replay/bounded` | open and replay the ~1 MiB log left by 1M overwrites of 100 keys | 454.6 µs | - |
-| `get/hit` | one `get` over 100k keys from a 900k-key store | 472.6 ns | 2.1M gets/s |
-| `append/set` | 10,000 `set`s, default `Durability::Never` | 7.33 ms | 1.36M writes/s (733 ns each) |
-| `append_durability/periodic_100_writes` | 500 `set`s, fsync every 100 writes | 9.19 ms | 54k writes/s |
-| `append_durability/always` | 500 `set`s, fsync per write | 644.9 ms | 775 writes/s (1.29 ms each) |
-| `compaction/merge` | full merge of 900k live records | 475.9 ms | 1.89M records/s |
-
-Reading the table:
-
-- Replay is the number that affects startup time. It is map-bound, not
-  parsing-bound: 1M records into a 900k-entry map takes 124 ms.
-- A `get` is a hash lookup plus one seek and one read.
-- Appends cost 733 ns each with no fsync. `always` costs 1.29 ms per write on this disk, so fsync is ~99% of the write cost. `periodic` amortizes it.
-- A merge rewrites the entire live set, so its cost is the pause a compaction causes: about 0.5 s per 900k live keys.
-
-## Known limitations
+## Limitations
 
 - Every CLI command replays the log on open.
 - No fsync by default: a power loss can lose recent writes. Use `--sync`, `Durability::Always`, or call `sync()`.
+- Linux only: positioned reads and the directory fsync use the Linux std extensions.
 - One store per directory, one process.
 - Compaction is merge-all and synchronous: there is no background merge (yet).
-- The index is in memory (RSS at 1M keys has not been measured yet).
+- The index is in memory: ~120 B per key (152 MiB for 1M keys, 1.2 GB for 10M), so hundreds of millions of keys are out of reach.
 - No read cache and no per-read checksum: corruption is detected during replay and compaction, not by `get`.
 - No iteration or range scans: keys are not ordered, and there is no way to list them yet.
 - The CLI is UTF-8 only while the library is byte-oriented.

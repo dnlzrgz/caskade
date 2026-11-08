@@ -665,3 +665,55 @@ fn compaction_waits_for_its_threshold() -> Result<()> {
 
     Ok(())
 }
+
+// Should keep `get` safe on a shared store: positioned reads do not move the
+// segment cursor, so two threads cannot read each other's offsets.
+#[test]
+fn concurrent_reads_do_not_move_the_cursor() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temp working dir");
+    let options = Options {
+        segment_max: 4096,
+        ..Options::default()
+    };
+    let mut store = KvStore::open_with(temp_dir.path(), options)?;
+
+    // Spread keys over several segments and include an empty value.
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+        .map(|i| {
+            let key = format!("key{i}").into_bytes();
+            let value = if i % 10 == 0 {
+                Vec::new()
+            } else {
+                vec![b'a' + (i % 26) as u8; i % 64]
+            };
+            (key, value)
+        })
+        .collect();
+    for (key, value) in &pairs {
+        store.set(key.clone(), value.clone())?;
+    }
+    assert!(store.segment_count() > 1, "the keys stayed in one segment");
+
+    let store = &store;
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let pairs = &pairs;
+            scope.spawn(move || {
+                for _ in 0..50 {
+                    for (key, value) in pairs {
+                        assert_eq!(&store.get(key).expect("key is in the index"), value);
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(())
+}
+
+// Should keep the "reads are safe from several threads" claim from drifting.
+#[test]
+fn store_is_sync() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<KvStore>();
+}

@@ -2,8 +2,8 @@
 //!
 //! A log-structured, persistent key/value store inspired by [bitcask](https://github.com/basho/bitcask),
 //! built from scratch as a learning project.
-//! This is not a production database: one writer, no background threads, and
-//! the API and scope of the project may change before reaching 1.0.
+//! This is not for production: Linux only, no background threads, and the API and scope of the project
+//! may change before reaching 1.0.
 //!
 //! ```
 //! use caskade::kv::{Durability, KvStore};
@@ -34,9 +34,9 @@
 //!
 //! ## Concurrency and locking
 //!
-//! A store is single-writer and [`KvStore`](kv::KvStore) is `!Sync` on purpose: `get`
-//! seeks the segment's shared file cursor, so two threads sharing one store would read
-//! each other's offsets. Opening a directory takes an advisory lock on `caskade.lock`; a
+//! Writes are single-writer (`&mut self`), but reads are not exclusive: `get` uses a
+//! positioned read, so a store can be shared with other threads and read from all of
+//! them. Opening a directory takes an advisory lock on `caskade.lock`; a
 //! second open fails at once with [`KvError::Locked`](crate::error::KvError::Locked).
 //! Retrying is the caller's job, and the kernel releases the lock when the process
 //! dies.
@@ -57,6 +57,10 @@
 //! - [`error`]: the error type
 //! - [`cli`]: `clap` types used by the `caskade` binary
 #![forbid(unsafe_code)]
+
+// Positioned reads and the directory fsync use the Linux std filesystem extensions.
+#[cfg(not(target_os = "linux"))]
+compile_error!("caskade targets Linux only");
 
 pub mod cli;
 pub mod error;
