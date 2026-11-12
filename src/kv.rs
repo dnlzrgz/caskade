@@ -18,7 +18,7 @@ use crate::{
 /// Prefix of the log files.
 pub const LOG_FILE: &str = "caskade.log";
 /// Advisory lock taken for the life of a store. It is never renamed, so compaction
-/// doesn't drop the lock the way renaming a data file would.
+/// doesn't drop.
 pub const LOCK_FILE: &str = "caskade.lock";
 const READ_BUF_CAPACITY: usize = 64 * 1024;
 
@@ -380,22 +380,24 @@ impl KvStore {
     }
 
     /// Sets the value of a byte key to a byte value. If the key already exists, the
-    /// previous value will be overwritten.
-    pub fn set(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
-        let (key, value) = (key.into(), value.into());
-        let pos = self.append(&Command::Set {
-            key: &key,
-            value: &value,
-        })?;
+    /// previous value will be overwritten. Both are borrowed for the call: the log is
+    /// the copy that matters, and the key is only cloned when it is new.
+    pub fn set(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
+        let (key, value) = (key.as_ref(), value.as_ref());
+        let pos = self.append(&Command::Set { key, value })?;
 
-        let key_len = key.len();
         let entry = Entry {
-            value_pos: record::value_offset(pos, key_len),
+            value_pos: record::value_offset(pos, key.len()),
             value_len: value.len() as u32,
             file_id: self.active,
         };
-        if let Some(old) = self.index.insert(key, entry) {
-            self.stale += record::record_len(key_len, old.value_len as usize) as u64;
+        // An overwrite keeps the key the index already owns instead of replacing it
+        // with a fresh allocation.
+        if let Some(old) = self.index.get_mut(key) {
+            self.stale += record::record_len(key.len(), old.value_len as usize) as u64;
+            *old = entry;
+        } else {
+            self.index.insert(key.to_vec(), entry);
         }
         self.maybe_compact();
 
@@ -561,17 +563,19 @@ impl KvStore {
         let mut head = [0u8; Header::SIZE];
         let mut payload = Vec::new();
         for (&id, offsets) in &live {
-            let mut file = self
+            let file = self
                 .files
                 .get(&id)
                 .ok_or_else(|| KvError::Corrupt(format!("segment {id} is missing")))?;
 
-            // Appends left the cursor at the end; start from the first record.
-            file.seek(SeekFrom::Start(record::FILE_HEADER_LEN as u64))?;
+            // Unbuffered, the scan costs two `read(2)` per record, header then
+            // payload, over every record in the segment.
+            let mut reader = BufReader::with_capacity(READ_BUF_CAPACITY, file);
+            reader.seek(SeekFrom::Start(record::FILE_HEADER_LEN as u64))?;
             let mut offset = record::FILE_HEADER_LEN as u64;
             let mut next = 0;
             loop {
-                let got = read_up_to(&mut file, &mut head)?;
+                let got = read_up_to(&mut reader, &mut head)?;
                 if got == 0 {
                     break;
                 }
@@ -584,7 +588,7 @@ impl KvStore {
                 let header = Header::decode(&head)?;
                 payload.resize(header.payload_len, 0);
 
-                let got = read_up_to(&mut file, payload.as_mut_slice())?;
+                let got = read_up_to(&mut reader, payload.as_mut_slice())?;
                 if got < header.payload_len {
                     return Err(KvError::Corrupt(format!(
                         "segment {id} ends in the middle of a record"
@@ -887,8 +891,13 @@ fn apply(index: &mut Map, stale: &mut u64, cmd: Command<'_>, record_pos: u64, fi
                 file_id,
             };
 
-            if let Some(old) = index.insert(key.to_vec(), entry) {
+            // A bounded log rewrites the same key many times; only the first insert
+            // owns the key.
+            if let Some(old) = index.get_mut(key) {
                 *stale += record::record_len(key.len(), old.value_len as usize) as u64;
+                *old = entry;
+            } else {
+                index.insert(key.to_vec(), entry);
             }
         }
         Command::Rm { key } => {
@@ -1197,17 +1206,14 @@ mod tests {
     fn failed_append_poisons_the_store() -> Result<()> {
         let dir = TempDir::new().unwrap();
         let mut store = KvStore::open(dir.path())?;
-        store.set("a".to_owned(), "1".to_owned())?;
+        store.set("a", "1")?;
         let good_len = store.active_len;
 
         store
             .files
             .insert(store.active, File::open(dir.path().join(segment_file(0)))?);
 
-        assert!(matches!(
-            store.set("b".to_owned(), "2".to_owned()),
-            Err(KvError::Io(_))
-        ));
+        assert!(matches!(store.set("b", "2"), Err(KvError::Io(_))));
         assert!(store.poisoned);
         assert!(matches!(store.get(b"b"), Err(KvError::KeyNotFound)));
         assert_eq!(
@@ -1216,10 +1222,7 @@ mod tests {
                 .len(),
             good_len
         );
-        assert!(matches!(
-            store.set("c".to_owned(), "3".to_owned()),
-            Err(KvError::Poisoned)
-        ));
+        assert!(matches!(store.set("c", "3"), Err(KvError::Poisoned)));
 
         Ok(())
     }
@@ -1233,9 +1236,9 @@ mod tests {
             interval: Duration::from_secs(3600),
         });
 
-        store.set("a".to_owned(), "1".to_owned())?;
+        store.set("a", "1")?;
         assert_eq!(store.unsynced_appends, 1);
-        store.set("b".to_owned(), "2".to_owned())?;
+        store.set("b", "2")?;
         assert_eq!(store.unsynced_appends, 0);
 
         Ok(())
@@ -1250,7 +1253,7 @@ mod tests {
             interval: Duration::from_secs(3600),
         });
 
-        store.set("a".to_owned(), "1".to_owned())?;
+        store.set("a", "1")?;
         assert_eq!(store.unsynced_appends, 1);
         store.sync()?;
         assert_eq!(store.unsynced_appends, 0);
@@ -1334,7 +1337,7 @@ mod tests {
         {
             let mut store = KvStore::open(dir.path())?;
             store.set_durability(Durability::Always);
-            store.set("a".to_owned(), "1".to_owned())?;
+            store.set("a", "1")?;
         }
 
         let store = KvStore::open(dir.path())?;

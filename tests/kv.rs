@@ -33,8 +33,8 @@ fn open_truncates_torn_tail() -> Result<()> {
     let path = temp_dir.path().join(segment_file(0));
     {
         let mut store = KvStore::open(temp_dir.path())?;
-        store.set("key1".to_owned(), "value1".to_owned())?;
-        store.set("key2".to_owned(), "value2".to_owned())?;
+        store.set("key1", "value1")?;
+        store.set("key2", "value2")?;
     }
     let good_len = fs::metadata(&path).unwrap().len();
 
@@ -50,7 +50,7 @@ fn open_truncates_torn_tail() -> Result<()> {
     assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
 
     // The next append must land at the truncated end, not after the torn record.
-    store.set("key3".to_owned(), "value3".to_owned())?;
+    store.set("key3", "value3")?;
     drop(store);
     let store = KvStore::open(temp_dir.path())?;
     assert_eq!(store.get(b"key3")?.as_slice(), b"value3");
@@ -65,8 +65,8 @@ fn open_rejects_mid_log_corruption() -> Result<()> {
     let path = temp_dir.path().join(segment_file(0));
     {
         let mut store = KvStore::open(temp_dir.path())?;
-        store.set("key1".to_owned(), "value1".to_owned())?;
-        store.set("key2".to_owned(), "value2".to_owned())?;
+        store.set("key1", "value1")?;
+        store.set("key2", "value2")?;
     }
 
     // Flip a byte of the first record's payload; its CRC no longer matches.
@@ -91,8 +91,8 @@ fn open_rejects_damaged_length() -> Result<()> {
     let path = temp_dir.path().join(segment_file(0));
     {
         let mut store = KvStore::open(temp_dir.path())?;
-        store.set("key1".to_owned(), "value1".to_owned())?;
-        store.set("key2".to_owned(), "value2".to_owned())?;
+        store.set("key1", "value1")?;
+        store.set("key2", "value2")?;
     }
 
     // A flipped length byte would otherwise read as a payload cut short by a crash.
@@ -115,8 +115,8 @@ fn get_stored_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
-    store.set("key2".to_owned(), "value2".to_owned())?;
+    store.set("key1", "value1")?;
+    store.set("key2", "value2")?;
 
     assert_eq!(store.get(b"key1")?.as_slice(), b"value1");
     assert_eq!(store.get(b"key2")?.as_slice(), b"value2");
@@ -130,9 +130,9 @@ fn overwrite_existing_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
+    store.set("key1", "value1")?;
     assert_eq!(store.get(b"key1")?.as_slice(), b"value1");
-    store.set("key1".to_owned(), "value2".to_owned())?;
+    store.set("key1", "value2")?;
     assert_eq!(store.get(b"key1")?.as_slice(), b"value2");
 
     Ok(())
@@ -144,7 +144,7 @@ fn get_non_existent_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
+    store.set("key1", "value1")?;
     assert!(matches!(store.get(b"key2"), Err(KvError::KeyNotFound)));
 
     Ok(())
@@ -156,7 +156,7 @@ fn remove_existent_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
+    store.set("key1", "value1")?;
     store.remove(b"key1")?;
     assert!(matches!(store.get(b"key1"), Err(KvError::KeyNotFound)));
 
@@ -180,9 +180,9 @@ fn set_after_remove() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temp working dir");
     let mut store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
+    store.set("key1", "value1")?;
     store.remove(b"key1")?;
-    store.set("key1".to_owned(), "value2".to_owned())?;
+    store.set("key1", "value2")?;
 
     assert_eq!(store.get(b"key1")?.as_slice(), b"value2");
 
@@ -199,7 +199,7 @@ fn open_drops_a_segment_created_short_by_a_crash() -> Result<()> {
 
     let mut store = KvStore::open(temp_dir.path())?;
     assert_eq!(store.dropped_bytes(), 4);
-    store.set("key1".to_owned(), "value1".to_owned())?;
+    store.set("key1", "value1")?;
     drop(store);
 
     let store = KvStore::open(temp_dir.path())?;
@@ -549,7 +549,7 @@ fn reopen_handles_varint_key_widths_and_large_values() -> Result<()> {
         for (i, key) in keys.iter().enumerate() {
             store.set(key.clone(), vec![b'0' + i as u8; 3])?;
         }
-        store.set(b"big".to_vec(), big.clone())?;
+        store.set(b"big", big.clone())?;
     }
 
     let store = KvStore::open(dir)?;
