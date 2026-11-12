@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 
 use caskade::{
     error::{KvError, Result},
-    kv::{KvStore, LOG_FILE, Options, segment_file},
+    kv::{KvStore, LOG_FILE, MAX_KEY_LEN, Options, segment_file},
 };
 
 // Should let only one store hold a directory at a time.
@@ -134,6 +134,50 @@ fn overwrite_existing_value() -> Result<()> {
     assert_eq!(store.get(b"key1")?.as_slice(), b"value1");
     store.set("key1", "value2")?;
     assert_eq!(store.get(b"key1")?.as_slice(), b"value2");
+
+    Ok(())
+}
+
+// Should reject a key over the cap without writing anything or poisoning the store.
+#[test]
+fn rejects_keys_over_the_limit() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temp working dir");
+    let mut store = KvStore::open(temp_dir.path())?;
+    let key = vec![b'k'; MAX_KEY_LEN + 1];
+
+    let before = store.log_bytes();
+    assert!(matches!(
+        store.set(&key, "value"),
+        Err(KvError::KeyTooLarge(n)) if n == MAX_KEY_LEN + 1
+    ));
+    assert_eq!(store.log_bytes(), before);
+
+    // `remove` stays uncapped, so an over-long key from an older log can be cleaned up.
+    assert!(matches!(store.remove(&key), Err(KvError::KeyNotFound)));
+
+    // The rejected write must leave the store usable.
+    store.set("key1", "value1")?;
+    drop(store);
+    let store = KvStore::open(temp_dir.path())?;
+    assert_eq!(store.get(b"key1")?.as_slice(), b"value1");
+    assert!(matches!(store.get(&key), Err(KvError::KeyNotFound)));
+
+    Ok(())
+}
+
+// Should accept a key exactly at the cap, across a reopen.
+#[test]
+fn accepts_a_key_at_the_limit() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temp working dir");
+    let key = vec![b'k'; MAX_KEY_LEN];
+    let mut store = KvStore::open(temp_dir.path())?;
+
+    store.set(&key, "value")?;
+    assert_eq!(store.get(&key)?.as_slice(), b"value");
+    drop(store);
+
+    let store = KvStore::open(temp_dir.path())?;
+    assert_eq!(store.get(&key)?.as_slice(), b"value");
 
     Ok(())
 }

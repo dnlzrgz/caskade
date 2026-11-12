@@ -1,15 +1,19 @@
 [package]
 name = "caskade"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.89"
 description = "Log-structured key/value store inspired by bitcask"
-repository = "https://github.com/dnlzrgz/caskade"
-homepage = "https://github.com/dnlzrgz/caskade"
-license = "MIT"
 readme = "README.md"
-keywords = ["key-value", "bitcask", "log-structured", "database"]
+homepage = "https://github.com/dnlzrgz/caskade"
+repository = "https://github.com/dnlzrgz/caskade"
+license = "MIT"
+keywords = ["bitcask", "database", "key-value", "log-structured"]
 categories = ["database-implementations"]
+
+[[bench]]
+harness = false
+name = "kv"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
@@ -25,16 +29,12 @@ proptest = "1.11"
 tempfile = "3.27.0"
 walkdir = "2.5.0"
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
 [profile.bench]
-strip = "none"
 debug = "line-tables-only"
+strip = "none"
 
-[[bench]]
-name = "kv"
-harness = false
+[profile.release]
+strip = true
+lto = "fat"
+panic = "abort"
+codegen-units = 1

@@ -15,6 +15,9 @@ use crate::{
     record::{self, Command, Header},
 };
 
+/// Largest key the writer accepts; a longer `Set` key returns [`KvError::KeyTooLarge`].
+pub use crate::record::MAX_KEY_LEN;
+
 /// Prefix of the log files.
 pub const LOG_FILE: &str = "caskade.log";
 /// Advisory lock taken for the life of a store. It is never renamed, so compaction
@@ -380,8 +383,7 @@ impl KvStore {
     }
 
     /// Sets the value of a byte key to a byte value. If the key already exists, the
-    /// previous value will be overwritten. Both are borrowed for the call: the log is
-    /// the copy that matters, and the key is only cloned when it is new.
+    /// previous value will be overwritten.
     pub fn set(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
         let (key, value) = (key.as_ref(), value.as_ref());
         let pos = self.append(&Command::Set { key, value })?;
@@ -424,7 +426,8 @@ impl KvStore {
         Ok(value)
     }
 
-    /// Removes a given key.
+    /// Removes a given key. Unlike `set`, this is not capped by [`MAX_KEY_LEN`], so a
+    /// key written by an older build can still be deleted.
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
         let Some(old) = self.index.get(key).copied() else {
             return Err(KvError::KeyNotFound);
@@ -931,6 +934,54 @@ mod tests {
         let mut stale = 0;
         let len = replay(Cursor::new(bytes), 0, &mut data, &mut stale)?;
         Ok((data, len))
+    }
+
+    #[test]
+    fn replay_does_not_enforce_key_cap() {
+        let key = vec![b'k'; MAX_KEY_LEN + 1];
+        let mut index = Map::default();
+        let mut stale = 0;
+        apply(
+            &mut index,
+            &mut stale,
+            Command::Set {
+                key: &key,
+                value: b"v",
+            },
+            0,
+            0,
+        );
+
+        assert!(index.contains_key(&key));
+    }
+
+    #[test]
+    fn a_key_over_the_cap_can_still_be_removed() -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        let key = vec![b'k'; MAX_KEY_LEN + 1];
+        let mut store = KvStore::open(dir.path())?;
+
+        // Pretend an older build wrote this record: `set` rejects it, replay accepts it.
+        apply(
+            &mut store.index,
+            &mut store.stale,
+            Command::Set {
+                key: &key,
+                value: b"v",
+            },
+            0,
+            store.active,
+        );
+
+        // Rejecting the tombstone would make the key impossible to delete.
+        store.remove(&key)?;
+        assert!(matches!(store.get(&key), Err(KvError::KeyNotFound)));
+        drop(store);
+
+        let store = KvStore::open(dir.path())?;
+        assert!(matches!(store.get(&key), Err(KvError::KeyNotFound)));
+
+        Ok(())
     }
 
     fn lookup<'a>(bytes: &'a [u8], data: &Map, key: &str) -> &'a [u8] {

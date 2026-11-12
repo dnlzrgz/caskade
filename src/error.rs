@@ -12,6 +12,8 @@ pub enum KvError {
     ChecksumMismatch,
     #[error("record too large: {0} bytes")]
     RecordTooLarge(usize),
+    #[error("key too large: {0} bytes")]
+    KeyTooLarge(usize),
     #[error("directory is locked by another store")]
     Locked,
     #[error("store is poisoned after a failed write")]

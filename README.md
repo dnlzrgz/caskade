@@ -116,6 +116,7 @@ Reading the table:
 - One store per directory, one process.
 - Compaction is merge-all and synchronous: there is no background merge (yet).
 - The index is in memory: ~120 B per key (152 MiB for 1M keys, 1.2 GB for 10M), so hundreds of millions of keys are out of reach.
+- `set` rejects keys over 4 KiB (`MAX_KEY_LEN`). `get` and `remove` stay uncapped so a key written by an older build remains readable and deletable.
 - The index uses `FxHash`, which is fast but not hash-flooding resistant: keys from an untrusted caller could be chosen to collide.
 - No read cache and no per-read checksum: corruption is detected during replay and compaction, not by `get`.
 - No iteration or range scans: keys are not ordered, and there is no way to list them yet.
@@ -149,7 +150,7 @@ payload := 0x00 | key_len varint | key | value    (Set; value is the rest)
 - `len` is the payload length, so a record spans `12 + len` bytes.
 - `crc` is CRC-32 over the payload; `hcrc` is CRC-32 over `len` and `crc`.
 - `key_len` is unsigned LEB128 (1 byte below 128, at most 4 bytes). The current
-  maximum payload is 64 MiB.
+  maximum payload is 64 MiB, and the writer rejects `Set` keys over 4 KiB.
 - Keys and values are opaque bytes. No encoding is assumed.
 
 Replay walks segments in ascending id and records in file order; the last record for a key wins.

@@ -21,6 +21,9 @@ use crate::error::{KvError, Result};
 
 /// Largest payload accepted.
 pub(crate) const MAX_RECORD: usize = 64 << 20; // 64 MiB
+/// Largest key a writer accepts. The index keeps every key in memory for the life
+/// of the store, so this bounds it. Write-path rule, not a format rule.
+pub const MAX_KEY_LEN: usize = 4 << 10;
 /// Size of [len][crc][hcrc].
 const HEADER_LEN: usize = 12;
 /// File marker, followed by a `u32` version.
@@ -155,9 +158,15 @@ pub(crate) fn check_file_header(head: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
+    let key_len = cmd.key_len();
+    // Rejecting `Rm` would make a key written by an older build impossible to delete.
+    if key_len > MAX_KEY_LEN && matches!(cmd, Command::Set { .. }) {
+        return Err(KvError::KeyTooLarge(key_len));
+    }
+
     let payload_len = match cmd {
-        Command::Set { key, value } => 1 + varint_len(key.len()) + key.len() + value.len(),
-        Command::Rm { key } => 1 + varint_len(key.len()) + key.len(),
+        Command::Set { value, .. } => 1 + varint_len(key_len) + key_len + value.len(),
+        Command::Rm { .. } => 1 + varint_len(key_len) + key_len,
     };
     if payload_len > MAX_RECORD {
         // Nothing has been touched, so the caller's buffer is unchanged.
@@ -173,8 +182,8 @@ pub(crate) fn encode(cmd: &Command<'_>, buf: &mut Vec<u8>) -> Result<()> {
         Command::Rm { key } => (TAG_RM, *key, None),
     };
     buf.push(tag);
-    // The check above bounds every field, so this cannot truncate.
-    put_varint(key.len() as u32, buf);
+    // The checks above bound every field, so this cannot truncate.
+    put_varint(key_len as u32, buf);
     buf.extend_from_slice(key);
     if let Some(value) = value {
         buf.extend_from_slice(value);
@@ -380,6 +389,39 @@ mod tests {
             Err(KvError::RecordTooLarge(_))
         ));
         assert_eq!(buf, [1, 2, 3]);
+    }
+
+    #[test]
+    fn encode_caps_set_keys_but_not_rm_keys() {
+        let mut buf = Vec::new();
+        let long = vec![b'a'; MAX_KEY_LEN + 1];
+
+        assert!(matches!(
+            encode(
+                &Command::Set {
+                    key: &long,
+                    value: b"v"
+                },
+                &mut buf
+            ),
+            Err(KvError::KeyTooLarge(n)) if n == MAX_KEY_LEN + 1
+        ));
+        assert!(buf.is_empty());
+
+        // A tombstone puts no key in the index, so an older log's key stays deletable.
+        assert!(encode(&Command::Rm { key: &long }, &mut buf).is_ok());
+
+        let at_cap = vec![b'a'; MAX_KEY_LEN];
+        assert!(
+            encode(
+                &Command::Set {
+                    key: &at_cap,
+                    value: b"v"
+                },
+                &mut buf
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -650,7 +692,7 @@ mod tests {
     /// to agree with `encode` at every varint width.
     #[test]
     fn record_len_matches_encode() {
-        for (key_len, value_len) in [(0, 0), (1, 1), (127, 0), (128, 300), (16383, 1), (16384, 2)] {
+        for (key_len, value_len) in [(0, 0), (1, 1), (127, 0), (128, 300), (MAX_KEY_LEN, 1)] {
             let key = vec![b'k'; key_len];
             let value = vec![b'v'; value_len];
 
@@ -666,6 +708,14 @@ mod tests {
             assert_eq!(set.len(), record_len(key_len, value_len));
             assert_eq!(&set[value_offset(0, key_len) as usize..], &value[..]);
 
+            let mut rm = Vec::new();
+            encode(&Command::Rm { key: &key }, &mut rm).unwrap();
+            assert_eq!(rm.len(), record_len(key_len, 0));
+        }
+
+        // Wider keys are over the write cap, so only tombstones can carry them.
+        for key_len in [16_383, 16_384] {
+            let key = vec![b'k'; key_len];
             let mut rm = Vec::new();
             encode(&Command::Rm { key: &key }, &mut rm).unwrap();
             assert_eq!(rm.len(), record_len(key_len, 0));
